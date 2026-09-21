@@ -1,0 +1,26 @@
+{
+  "minVersion": "0.8.5",
+  "compatibilityLevel": "JAVA_21",
+  "required": false,
+  "package": "dev.mediafix.mixin",
+  "client": [
+    "SimpleFileServerMixin",
+    "VideoPlayerMixin",
+    "WaterframesSeekGuardMixin",
+    "PanoramicAudioMixin",
+    "VideoPlayerVolumeMixin",
+    "CommentHideMixin",
+    "BilibiliPatchMixin",
+    "BilibiliBangumiPatchMixin",
+    "ImageCacheDiagMixin",
+    "DisplayDiagMixin",
+    "DisplayTileDiagMixin",
+    "BasePlayerDiagMixin",
+    "NetworkApiDiagMixin",
+    "VlcLogMixin",
+    "DisplayAspectMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
