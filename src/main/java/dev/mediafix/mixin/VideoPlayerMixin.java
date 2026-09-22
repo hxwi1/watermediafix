@@ -1,5 +1,6 @@
 package dev.mediafix.mixin;
 
+import dev.mediafix.render.GlStateSync;
 import dev.mediafix.render.Letterbox;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL13;
@@ -59,6 +60,10 @@ public abstract class VideoPlayerMixin {
         GL11.glPixelStorei(GL11.GL_UNPACK_ROW_LENGTH, s[2]);
         GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_ROWS, s[3]);
         GL11.glPixelStorei(GL11.GL_UNPACK_SKIP_PIXELS, s[4]);
+        // 关键：MC 的 GlStateManager 绑定缓存被原生 GL 调用绕过后与真实状态脱节，
+        // 后续 MC 因缓存命中跳过 bind → 固定几个 GUI 材质采样到视频纹理（F3+T 才恢复）。
+        // 这里把缓存同步回真实状态，从根上消除 GUI 污染。
+        GlStateSync.sync(s[0], s[1]);
     }
 
     /** 信箱化上传：转发给 Letterbox（实现见 dev.mediafix.render.Letterbox）。 */

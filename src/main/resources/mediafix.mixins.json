@@ -18,7 +18,9 @@
     "BasePlayerDiagMixin",
     "NetworkApiDiagMixin",
     "VlcLogMixin",
-    "DisplayAspectMixin"
+    "DisplayAspectMixin",
+    "GlStateManagerAccessor",
+    "TextureStateAccessor"
   ],
   "injectors": {
     "defaultRequire": 1
