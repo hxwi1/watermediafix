@@ -20,7 +20,9 @@
     "VlcLogMixin",
     "DisplayAspectMixin",
     "GlStateManagerAccessor",
-    "TextureStateAccessor"
+    "TextureStateAccessor",
+    "DynamicTextureDiagMixin",
+    "DynamicTextureSafetyMixin"
   ],
   "injectors": {
     "defaultRequire": 1
