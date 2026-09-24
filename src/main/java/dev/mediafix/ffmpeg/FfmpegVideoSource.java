@@ -368,6 +368,7 @@ public final class FfmpegVideoSource implements AutoCloseable {
     /** 请求跳转到指定位置（毫秒）。由渲染线程或控制线程调用，实际 seek 在解码线程执行。 */
     public void requestSeek(long ms) {
         this.seekRequestMs = Math.max(0L, ms);
+        this.lastRequestedSeekMs = this.seekRequestMs;
         this.seekRequested = true;
         this.lastSeekAtMs = System.currentTimeMillis();
         // 同音频源：立刻作废队列里已有的帧，避免旧位置的帧被当成 seek 之后的内容显示出来
@@ -551,6 +552,32 @@ public final class FfmpegVideoSource implements AutoCloseable {
             return;
         }
         if (sign == 0) return;
+        /*
+         * ★ seek 之后的"过渡期"必须放过去：这段时间视频和声卡的落点天然不同步。
+         *
+         * 实测（mediafix-2026-09-24_11-04-30.log）：
+         *   11:06:32.678 waterframes 要求对齐到 87650ms（我们因缓冲落后了 21 秒）
+         *   11:06:32.692 视频/音频都发起 seek，视频缓冲见底，要等网络
+         *   11:06:36.457 自愈判定"视频超前时钟 21322ms"，把视频 seek 回 66303ms ← 服务端的对齐被撤销
+         *   11:06:38.727 音频缓冲回填，时钟才跳到 87530ms
+         * 原因是声卡的"已播出位置"要等缓冲回填并真正播出去才会跟着 seek 跳（这次花了 6 秒），
+         * 而视频解码 1 秒内就落到新位置了。拿这个"还没醒过来"的旧时钟去纠正视频，
+         * 等于把刚做的对齐整个抹掉 —— 表现就是"跳到服务端要的位置又弹回旧位置，声音却在新位置"。
+         *
+         * 判据：视频已经落在【我们请求的那个 seek 目标】上（±2 秒），且 seek 后 30 秒内。
+         * 这时该等的是音频，不是动视频。
+         */
+        if (this.lastRequestedSeekMs >= 0 && now - this.lastSeekAtMs < 30_000L
+                && ((sign > 0 && minPts != Long.MAX_VALUE && Math.abs(minPts - this.lastRequestedSeekMs) < 2000L)
+                    || (sign < 0 && presented != null && Math.abs(presented.ptsMs - this.lastRequestedSeekMs) < 2000L))) {
+            this.desyncSince = now;                    // 不累计，等音频把时钟挪过去
+            if (now - this.lastSettleLogAt > 1000L) {
+                this.lastSettleLogAt = now;
+                MediaFix.LOGGER.info("[mediafix] seek 过渡期：视频已在目标 {}ms，等音频时钟跟上（当前时钟 {}ms）",
+                        this.lastRequestedSeekMs, clockMs);
+            }
+            return;
+        }
         if (now - this.desyncSince < 3000L) return;          // 还没持续够久
         if (now - this.lastSeekAtMs < 3000L) return;          // seek 刚发生，不同步是正常的
         if (now - this.lastDesyncSeekAt < 10000L) return;     // 限速
@@ -563,6 +590,16 @@ public final class FfmpegVideoSource implements AutoCloseable {
     }
 
     private volatile long lastDesyncSeekAt;
+    /**
+     * 最近一次【请求】的 seek 目标位置（-1 = 没有）。
+     *
+     * <p>注意与 {@link #seekTargetMs} 的区别：那个是"精确寻址"的临时目标，第一帧追上后就归 -1；
+     * 这个是"我们要求跳到哪儿"的记录，要留一段时间 —— evalDesync 靠它区分
+     * "视频已落到 seek 目标、只是音频时钟还没跟上"（过渡期，别动视频）和"真的脱节"。
+     */
+    private volatile long lastRequestedSeekMs = -1L;
+    /** 上一条"seek 过渡期"诊断的时间（限流）。 */
+    private volatile long lastSettleLogAt;
     /** 1 = 视频超前, -1 = 视频落后, 0 = 正常。 */
     private int desyncSign;
     private long desyncSince;

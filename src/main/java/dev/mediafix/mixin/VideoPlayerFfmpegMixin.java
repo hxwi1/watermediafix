@@ -44,6 +44,14 @@ public abstract class VideoPlayerFfmpegMixin {
         if (engine == null) return;
 
         FfmpegVideoSource.Frame frame = engine.acquireVideoFrame();
+        if (frame == null && this.texture != this.mediafix$tex) {
+            /*
+             * 这个播放器（或这张纹理）还没上传过任何一帧。若此时引擎处于暂停状态，
+             * 正常通道会一直不给帧 —— 表现就是"暂停着换源 = 全黑"。补一帧，
+             * 让暂停显示的是"停住的那一帧"而不是黑屏（VLC 就是这个行为）。
+             */
+            frame = engine.acquireFrameForPausedDisplay();
+        }
         if (frame == null) return;
 
         try {

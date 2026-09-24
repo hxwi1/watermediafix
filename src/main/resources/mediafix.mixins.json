@@ -6,6 +6,8 @@
   "client": [
     "VideoPlayerMixin",
     "WaterframesSeekGuardMixin",
+    "TimePacketMixin",
+    "DisplayTileTimeSyncMixin",
     "PanoramicAudioMixin",
     "VideoPlayerVolumeMixin",
     "CommentHideMixin",

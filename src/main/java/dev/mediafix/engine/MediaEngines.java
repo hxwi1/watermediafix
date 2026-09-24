@@ -47,9 +47,46 @@ public final class MediaEngines {
     private record Orphan(MediaEngine engine, long deadline) {
     }
 
-    /** 把引擎放进暂存区等接管。 */
+    /**
+     * 引擎是否仍被某个"活着的"播放器对象持有。
+     *
+     * <p>WeakHashMap 的键失效是**惰性清理**的：键被 GC 之后条目在被访问前仍然留在表里。
+     * 它的 {@code Entry} 本身就是弱引用，所以 {@code getKey()} 真会返回 null —— 用它区分
+     * "还挂着的播放器"和"已经没人引用的旧条目"。
+     *
+     * <p>这个判断是"黑屏"事故的分水岭：详见 {@link #orphan(MediaEngine)}。
+     */
+    private static boolean stillHeld(MediaEngine engine) {
+        synchronized (ENGINES) {
+            for (Map.Entry<Object, MediaEngine> en : ENGINES.entrySet()) {
+                if (en.getValue() == engine && en.getKey() != null) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 把引擎放进暂存区等接管。
+     *
+     * <p>★ 但"被回收"这件事本身可能是假的，判据必须再核一遍：只要还有活着的播放器挂着它，
+     * 它就绝不是孤儿，一秒钟都不能关。
+     *
+     * <p>实测事故（mediafix-2026-09-24_10-04-10.log，10:28:45 画面全黑）：
+     * waterframes 换播放器时会 {@code release()} 掉旧对象 P0，于是引擎 E 被移出注册表并挂成孤儿；
+     * 5 秒后 P0 被 GC，它当初留在 {@code LIVE_REFS} 里的弱引用入队，reaper 又给 E 减了一次计数
+     * （"同一视频转交给新播放器 P1"的 retain 正好被这次多余的减扣抵消）—— 于是**正在给 P1 出画面**
+     * 的 E 被第二次挂成孤儿，20 秒后被 sweep 关掉。E 一关，video/audio 源置空 →
+     * {@code isBroken()}=true → {@code readyForDisplay()}=false → waterframes 的 canRender() 恒 false
+     * → 画面再也不画（日志里 10:28:45 起 canRender=false … 引擎状态=PLAYING 引擎就绪可显示=false 一直刷）。
+     */
     private static void orphan(MediaEngine engine) {
+        if (stillHeld(engine)) {
+            // 不是孤儿：某个活着的播放器还挂着它（典型是上面那次多余的减扣）。
+            return;
+        }
         synchronized (ORPHANS) {
+            // 同一个引擎只留一条记录，避免"假孤儿"叠加把宽限期无限拖长
+            ORPHANS.removeIf(o -> o.engine() == engine);
             ORPHANS.add(new Orphan(engine, System.currentTimeMillis() + ORPHAN_GRACE_MS));
         }
         MediaFix.LOGGER.info("[mediafix] 播放器被回收，引擎保留 {} 秒等待接管（同一视频的新播放器可无缝续用）",
@@ -59,16 +96,17 @@ public final class MediaEngines {
     /** 关掉超时没被接管的孤儿引擎。 */
     private static void sweepOrphans() {
         java.util.List<MediaEngine> expired = null;
-        synchronized (ORPHANS) {
-            long now = System.currentTimeMillis();
-            for (java.util.Iterator<Orphan> it = ORPHANS.iterator(); it.hasNext(); ) {
-                Orphan o = it.next();
-                if (o.deadline() <= now) {
-                    it.remove();
-                    if (expired == null) expired = new java.util.ArrayList<>();
-                    expired.add(o.engine());
-                }
+        long now = System.currentTimeMillis();
+        for (Orphan o : snapshotOrphans()) {
+            if (o.deadline() > now) continue;
+            if (stillHeld(o.engine())) {
+                // 宽限期内又被某个播放器挂上了（或本来就是"假孤儿"）：顺延，绝不关正在用的引擎
+                extendOrphan(o.engine(), now + ORPHAN_GRACE_MS);
+                continue;
             }
+            dropOrphan(o.engine());
+            if (expired == null) expired = new java.util.ArrayList<>();
+            expired.add(o.engine());
         }
         if (expired == null) return;
         for (MediaEngine e : expired) {
@@ -77,6 +115,29 @@ public final class MediaEngines {
                 e.close();
             } catch (Throwable ignored) {
             }
+        }
+    }
+
+    private static java.util.List<Orphan> snapshotOrphans() {
+        synchronized (ORPHANS) {
+            return new java.util.ArrayList<>(ORPHANS);
+        }
+    }
+
+    private static void extendOrphan(MediaEngine engine, long deadline) {
+        synchronized (ORPHANS) {
+            for (int i = 0; i < ORPHANS.size(); i++) {
+                if (ORPHANS.get(i).engine() == engine) {
+                    ORPHANS.set(i, new Orphan(engine, deadline));
+                    return;
+                }
+            }
+        }
+    }
+
+    private static void dropOrphan(MediaEngine engine) {
+        synchronized (ORPHANS) {
+            ORPHANS.removeIf(o -> o.engine() == engine);
         }
     }
 
@@ -89,6 +150,13 @@ public final class MediaEngines {
 
     private static final class PlayerRef extends java.lang.ref.WeakReference<Object> {
         final MediaEngine engine;
+        /**
+         * 该播放器是否已经被 {@link #close(Object)} 显式回收过。
+         *
+         * <p>被显式回收的播放器，它的弱引用入队时**不能再减一次计数** —— 那一次多余的减扣
+         * 会把"正在被新播放器使用"的引擎误判成孤儿（见 {@link #orphan(MediaEngine)} 的事故说明）。
+         */
+        volatile boolean released;
 
         PlayerRef(Object player, MediaEngine engine) {
             super(player, REAPED);
@@ -104,13 +172,15 @@ public final class MediaEngines {
                     java.lang.ref.Reference<?> r = REAPED.remove(5000);
                     if (r instanceof PlayerRef pr) {
                         LIVE_REFS.remove(pr);
+                        // 已经被 release() 显式回收过的播放器：它的引擎那次已经减过计数了，别重复减
+                        if (pr.released) continue;
                         // 还有别的播放器持有同一个引擎（同源转交）时不能关，否则那一路会突然断掉
                         if (pr.engine.release() > 0) {
                             MediaFix.LOGGER.info("[mediafix] 播放器被回收，但引擎仍被其它播放器持有，保持播放");
                             continue;
                         }
                         // 不立刻关：留一段时间给"同一个视频的新播放器"接管（见 ORPHAN_GRACE_MS）
-                        pr.engine.release();
+                        pr.released = true;
                         orphan(pr.engine);
                     }
                 } catch (InterruptedException e) {
@@ -157,7 +227,22 @@ public final class MediaEngines {
     }
 
     public static MediaEngine of(Object player) {
-        return player == null ? null : ENGINES.get(player);
+        if (player == null) return null;
+        MediaEngine e = ENGINES.get(player);
+        if (e == null) return null;
+        if (e.isClosed()) {
+            /*
+             * 已经关掉的引擎不能再回答状态。
+             *
+             * 关闭会把 video/audio 源置空，于是 isBroken()=true、readyForDisplay()=false，
+             * 而 state 还停在 PLAYING —— waterframes 拿到的就是"在播、但永远不渲染"，
+             * 画面从此全黑（实测 10:28:45 那次事故的收尾状态）。
+             * 引擎都关了，这里就不该再冒充它的回答：摘掉映射，让上层走它自己的逻辑。
+             */
+            ENGINES.remove(player);
+            return null;
+        }
+        return e;
     }
 
     /** 找出同一个视频、仍然存活的引擎（用于播放器对象被重建时转交）。 */
@@ -227,6 +312,15 @@ public final class MediaEngines {
             lastCreated = reusable;
             MediaFix.LOGGER.info("[mediafix] 同一个视频，引擎转交给新播放器（省去重新缓冲）: status={} pos={}ms",
                     reusable.state(), reusable.timeMs());
+            /*
+             * 引擎停在片尾时，新播放器其实是"重新播放"：waterframes 的新播放器要从头开始，
+             * 而我们这个引擎还站在片尾（帧环空、出不了帧）—— 不把它拉回起点，
+             * 新播放器就一直等一个永远不会来的帧，表现就是"重新请求视频后一直正在加载"。
+             */
+            if (reusable.isEnded()) {
+                MediaFix.LOGGER.info("[mediafix] 该引擎已播完，重新播放：回到起点");
+                reusable.seek(0L);
+            }
             return reusable;
         }
 
@@ -274,6 +368,10 @@ public final class MediaEngines {
 
     public static void close(Object player) {
         MediaEngine old = ENGINES.remove(player);
+        // 该播放器的弱引用从此不再参与计数（否则它被 GC 时会再减一次，见 PlayerRef.released）
+        for (PlayerRef r : LIVE_REFS) {
+            if (r.get() == player) r.released = true;
+        }
         if (old == null) return;
         // 还有别的播放器持有它（同源转交）就只减引用，别把还在播的那路一起关掉
         if (old.release() > 0) {
@@ -334,13 +432,17 @@ public final class MediaEngines {
             for (Orphan o : ORPHANS) victims.add(o.engine());
             ORPHANS.clear();
         }
-        MediaFix.LOGGER.info("[mediafix] {}：关闭 {} 个无人接管的旧引擎", why, victims.size());
+        int closed = 0;
         for (MediaEngine e : victims) {
+            // 还挂在活着的播放器上的不算"无人接管"：关掉它同样会造成永久黑屏
+            if (stillHeld(e)) continue;
+            closed++;
             try {
                 e.close();
             } catch (Throwable ignored) {
             }
         }
+        MediaFix.LOGGER.info("[mediafix] {}：关闭 {} 个无人接管的旧引擎", why, closed);
     }
 
     /** 无条件关闭（退出世界用，不看引用计数）。 */

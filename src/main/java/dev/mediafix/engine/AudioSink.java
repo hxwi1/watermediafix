@@ -45,6 +45,21 @@ public final class AudioSink implements AutoCloseable {
     /** 下一次块边界跳变是预期内的（就地快进/跳转），仍去咔但不计入爆音统计。 */
     private volatile boolean expectJump;
 
+    /**
+     * 下一块必须做淡入去咔（一次性）。
+     *
+     * <p>有三种"拼接"在采样连续性检查里是【看不出来】的，只能靠这个标志：
+     * <ul>
+     *   <li><b>设备缓冲写空（欠载）</b> —— 声卡已经播出去一段【我们数据里根本没有的静音】，
+     *       新块从任意相位接回去就是"咔"的一下，而我们的数据首尾是连续的；</li>
+     *   <li><b>seek / 就地快进</b> —— flush 之后新旧位置毫无关系；</li>
+     *   <li><b>暂停后恢复</b> —— 线路 stop/start，接缝同理。</li>
+     * </ul>
+     * 实测：这三类接缝在日志里 爆音=0 去咔=0（检测器一次都没报），但耳朵听得很清楚 ——
+     * 就是因为它们根本不在我们的采样数据里。
+     */
+    private volatile boolean forceDeclick;
+
     public long declicks() {
         return this.declicks;
     }
@@ -184,6 +199,8 @@ public final class AudioSink implements AutoCloseable {
         // 刚开声或刚 seek 完（缓冲必然为空）不算欠载，只统计"已经在正常播放中"的情况
         if (this.writtenFrames > this.sampleRate && free0 >= l.getBufferSize() - length - 2048) {
             this.underruns++;
+            // 设备已经播出去一段静音：下一块的起跳沿必须削掉，否则就是"咔"的一下
+            this.forceDeclick = true;
         }
         /*
          * ★ 必须写满整块。
@@ -229,7 +246,16 @@ public final class AudioSink implements AutoCloseable {
             int d = Math.abs(b - a);
             if (d > maxInner) maxInner = d;
         }
-        if (this.haveLastSample) {
+        if (this.forceDeclick) {
+            /*
+             * 设备刚欠载（播出去一段数据里根本没有的静音）、刚 seek 或刚恢复播放：
+             * 这些接缝在我们的采样数据里是连续的，下面那套"边界跳变远大于块内跳变"永远发现不了，
+             * 但耳朵照样听得见 —— 无条件削掉起跳沿。
+             */
+            this.forceDeclick = false;
+            this.expectJump = false;
+            declick(length);
+        } else if (this.haveLastSample) {
             int jump = Math.abs(firstSample - this.lastSample);
             if (jump > 6000 && jump > maxInner * 3) {
                 /*
@@ -300,6 +326,8 @@ public final class AudioSink implements AutoCloseable {
         }
         if (this.writtenFrames > this.sampleRate && free0 >= l.getBufferSize() - length - 2048) {
             this.underruns++;
+            // 设备已经播出去一段静音：下一块的起跳沿必须削掉，否则就是"咔"的一下
+            this.forceDeclick = true;
         }
         int off = 0;
         while (off < length) {
@@ -328,7 +356,8 @@ public final class AudioSink implements AutoCloseable {
      */
     private void declick(int length) {
         int ch = Math.max(1, this.channels);
-        int frames = Math.min(length / (2 * ch), Math.max(1, this.sampleRate / 1000));
+        // 只在真正的接缝上做，所以可以给足 3ms（1ms 对满幅跳变还是能听见"噗"）
+        int frames = Math.min(length / (2 * ch), Math.max(1, this.sampleRate * 3 / 1000));
         if (frames <= 0) return;
         for (int i = 0; i < frames; i++) {
             double g = 0.5 - 0.5 * Math.cos(Math.PI * (i + 1) / (double) frames);
@@ -387,8 +416,12 @@ public final class AudioSink implements AutoCloseable {
         if (l == null || this.paused == paused) return;
         this.paused = paused;
         try {
-            if (paused) l.stop();
-            else l.start();
+            if (paused) {
+                l.stop();
+            } else {
+                l.start();
+                this.forceDeclick = true;   // 线路 stop/start 之后同样是一处接缝
+            }
         } catch (Throwable ignored) {
         }
     }
@@ -400,6 +433,7 @@ public final class AudioSink implements AutoCloseable {
      */
     public void expectDiscontinuity() {
         this.expectJump = true;
+        this.forceDeclick = true;      // 快进后的第一块必须淡入：新旧位置毫无关系
     }
 
     public void flush() {
@@ -408,6 +442,8 @@ public final class AudioSink implements AutoCloseable {
         try {
             l.flush();
             this.writtenFrames = l.getLongFramePosition();
+            // 丢弃缓冲 = 波形在中途被硬切，下一块是全新相位：必须淡入
+            this.forceDeclick = true;
         } catch (Throwable ignored) {
         }
     }

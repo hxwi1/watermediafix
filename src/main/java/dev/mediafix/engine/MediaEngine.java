@@ -486,7 +486,8 @@ public final class MediaEngine implements AutoCloseable {
                 }
                 setState(State.BUFFERING, "视频缓冲见底");
             }
-        } else if (vbuf >= VIDEO_HIGH_BYTES) {
+        } else if (vbuf >= VIDEO_HIGH_BYTES || v.isEnded()) {
+            // 流已经读到尽头时不可能再回填到高水位：这时候的"等待网络"是等不到的，必须解除
             this.rebufferHold = false;
             this.sink.setPaused(false);
             MediaFix.LOGGER.info("[mediafix] 视频缓冲已回填到 {}KB，恢复播放", vbuf / 1024);
@@ -734,16 +735,53 @@ public final class MediaEngine implements AutoCloseable {
         if (this.wantPause == paused) return;
         this.wantPause = paused;
         if (this.audio != null) this.audio.setPaused(paused);
-        if (this.video != null) this.video.setPaused(paused);
+        /*
+         * ★ 暂停时画面应该是"停住的那一帧"（VLC 的行为），而不是黑屏。
+         *
+         * 以前这里无条件把视频源也停掉：如果此时恰好刚换过源（播放器是新的、纹理还是空的），
+         * 屏幕上就一帧都没有 = 全黑。实测 11:09:03 显示方块切到 B 站直播源时，方块本身处于
+         * 暂停状态（waterframes 的 switchVideoMode 会把 data.paused 直接套给新播放器），
+         * 于是整场 20 秒引擎一直是 PAUSED、一帧没解 → 全黑，看起来就像"直播被修坏了"。
+         *
+         * 现在的规则：已经有过画面 → 视频源一起冻住（保持冻结那一帧，也不白解码）；
+         * 一帧都没有 → 让解码先跑到能取到一帧为止，渲染侧取到后由
+         * {@link #acquireFrameForPausedDisplay()} 把它冻回去（见 VideoPlayerFfmpegMixin）。
+         */
         this.sink.setPaused(paused);
         if (paused) {
             this.clock.pause();
             this.sink.flush();
+            /*
+             * 已经有画面的暂停：视频源一起冻住（保持冻结那一帧，也不白解码）。
+             * 一帧都还没有的暂停（换源瞬间）：先让解码跑到"能取到一帧"为止，
+             * 渲染侧取到那一帧后由 acquireFrameForPausedDisplay() 把它冻住。
+             */
+            if (this.video != null && this.video.framesPresented() > 0) this.video.setPaused(true);
             setState(State.PAUSED);
+            MediaFix.LOGGER.info("[mediafix] 已暂停（waterframes 的暂停/停止指令）：画面停在当前帧，音频停播");
         } else {
+            if (this.video != null) this.video.setPaused(false);
             this.clock.start();
             setState(State.PLAYING);
+            MediaFix.LOGGER.info("[mediafix] 继续播放（waterframes 的播放指令）");
         }
+    }
+
+    /**
+     * 暂停期间给"还没有画面"的播放器补一帧（保持时钟冻结，所以取到的就是暂停位置那一帧）。
+     *
+     * <p>正常通道 {@link #acquireVideoFrame()} 在暂停时恒返回 null —— 那是为了不空转上传；
+     * 但新播放器/新纹理连一帧都没上传过时，屏幕就是黑的，这时候必须补一帧。
+     */
+    public FfmpegVideoSource.Frame acquireFrameForPausedDisplay() {
+        FfmpegVideoSource v = this.video;
+        if (v == null || !v.isReady()) return null;
+        // 帧环可能是空的（解码被冻着）：先放它跑，等这一帧出来
+        v.setPaused(false);
+        FfmpegVideoSource.Frame frame = v.acquire(this.clock.timeMs() + FfmpegConfig.avOffsetMs);
+        // 补到这一帧就把视频源冻回去：暂停期间不该一直解码，否则帧环会一直涨在冻结时钟前面
+        if (frame != null) v.setPaused(true);
+        return frame;
     }
 
     public void seek(long ms) {
@@ -800,7 +838,7 @@ public final class MediaEngine implements AutoCloseable {
             this.seekBurstCount = 1;
         } else if (++this.seekBurstCount == 4) {
             MediaFix.LOGGER.warn("[mediafix] seek 风暴：2 秒内被反复 seek {} 次（目标 {}ms，时钟 {}ms，状态 {}）"
-                            + " —— 说明进度纠偏在和我们互相追",
+                            + " —— 多半是服务端进度同步/拖动进度条在连续下发；只有持续十几秒不消停才说明纠偏在和我们互追",
                     this.seekBurstCount, target, timeMs(), this.state);
         }
         /*
@@ -1016,6 +1054,17 @@ public final class MediaEngine implements AutoCloseable {
          */
         if (this.wantPause) return;
         long now = System.currentTimeMillis();
+        /*
+         * ★ 片尾判定必须在这里也做一次。
+         *
+         * checkEnded() 原本只在 feedLoop"音频取不到下一块"时被调用，而 feedLoop 在
+         * rebufferHold（视频预读见底）时整段跳过 —— 视频播到片尾时预读必然见底且再也回填不上
+         * （流已经读完），于是这个 hold 永久为真，checkEnded() 一次都跑不到：
+         * 引擎既进不了 ENDED 也不会停，每 4 秒被下面这条兜底在 BUFFERING ⇄ PLAYING 之间来回拽，
+         * waterframes 那边就是"一直显示正在加载"（实测 11:18:59~11:19:12 十几秒，
+         * 取帧计数一动不动：取=318 还=318 时钟=94036ms 帧环=0）。
+         */
+        checkEnded();
         if (this.state == State.BUFFERING && now - this.bufferingSince > 4000L) {
             this.clock.start();
             setState(State.PLAYING, "缓冲超时兜底");
@@ -1422,12 +1471,23 @@ public final class MediaEngine implements AutoCloseable {
 
     private void checkEnded() {
         if (this.state == State.ERROR || this.closed) return;
-        if (!isEnded()) return;
+        // 时长未知（直播、或还没探测出来）就没有"片尾"这回事
+        long dur = durationMs();
+        if (dur <= 0) return;
         // 保护：某个源可能提前报 EOF（例如 seek 落到片尾、或音频轨先读完）。
         // 时长还没走到头就不能认定为"播放结束"，否则循环播放会直接 seek(0) 重来 ——
         // 表现就是"每次播放都从头开始"。
-        long dur = durationMs();
-        if (dur > 0 && timeMs() < dur - 2000L) return;
+        if (timeMs() < dur - 1000L) return;
+
+        /*
+         * 不能只信两个源的 EOF 标记：实测视频源在片尾会卡在"等网络"上（帧环空、预读 0KB），
+         * 它的 ended 永远是 false，于是 isEnded() 永远为 false。
+         * 补一条保守兜底：位置已经抵住片尾（上面那道 1 秒的保护已经过了），
+         * 又连续 8 秒出不了任何帧、压缩预读也空了 —— 那就是放完了。
+         */
+        boolean starvedAtEnd = System.currentTimeMillis() - this.lastFrameWallMs > 8000L
+                && this.video != null && this.video.bufferedBytes() <= 0L;
+        if (!isEnded() && !starvedAtEnd) return;
 
         if (this.repeat) {
             MediaFix.LOGGER.info("[mediafix] 播放结束，循环回起点");
@@ -1437,7 +1497,8 @@ public final class MediaEngine implements AutoCloseable {
         }
         if (this.state != State.ENDED) {
             setState(State.ENDED);
-            MediaFix.LOGGER.info("[mediafix] 播放结束");
+            this.rebufferHold = false;
+            MediaFix.LOGGER.info("[mediafix] 播放结束（时长 {}ms）", dur);
         }
     }
 

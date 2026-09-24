@@ -49,9 +49,9 @@ public abstract class DisplayFfmpegMixin {
         this.mediafix$lastNoRenderAt = now;
         dev.mediafix.MediaFix.LOGGER.warn(
                 "[mediafix] 引擎在播但 waterframes 不渲染画面：canRender=false"
-                        + " | safeUse={} waiting={} loading={} ready={} displayActive={} 引擎状态={} 引擎就绪可显示={}",
+                        + " | safeUse={} waiting={} loading={} ready={} displayActive={} 引擎状态={} 引擎已关闭={} 引擎就绪可显示={}",
                 this.mediaPlayer.isSafeUse(), this.mediaPlayer.isWaiting(), this.mediaPlayer.isLoading(),
                 this.mediaPlayer.isReady(), this.tile != null && this.tile.data.active,
-                engine.state(), engine.readyForDisplay());
+                engine.state(), engine.isClosed(), engine.readyForDisplay());
     }
 }
