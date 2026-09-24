@@ -200,6 +200,15 @@ public final class MediaEngines {
 
     /** 为播放器创建并启动引擎（已存在则先关掉旧的）。 */
     public static MediaEngine create(Object player, URI videoUri, URI audioUri, String headers) {
+        return create(player, videoUri, audioUri, headers, false);
+    }
+
+    /**
+     * @param live 本次是否是 B 站直播（由解析阶段经 {@code DashHandoff} 传进来）。
+     *             直播模式下引擎会忽略一切 seek、不参与 ABR、断流自动重连，
+     *             并用系统时间锚定时间轴（可读位置 + 实时延迟）。
+     */
+    public static MediaEngine create(Object player, URI videoUri, URI audioUri, String headers, boolean live) {
         if (player == null || videoUri == null) return null;
 
         /*
@@ -225,7 +234,7 @@ public final class MediaEngines {
         dropOrphans("换到其它视频");
         close(player);
         try {
-            MediaEngine engine = new MediaEngine(videoUri, audioUri, headers);
+            MediaEngine engine = new MediaEngine(videoUri, audioUri, headers, live);
             lastCreated = engine;
             ENGINES.put(player, engine);
             if (LIVE_REFS.isEmpty()) startReaper();
@@ -308,8 +317,9 @@ public final class MediaEngines {
             e.close();
         } catch (Throwable ignored) {
         }
-        MediaEngine fresh = create(player, v, a, headers);
-        if (fresh != null && pos > 0) {
+        MediaEngine fresh = create(player, v, a, headers, e.liveSession());
+        // 直播没有可跳位置（seek 会被忽略），也就不需要恢复位置了
+        if (fresh != null && pos > 0 && !e.liveSession()) {
             fresh.seek(pos);   // 引擎还没 boot 也不要紧：它会记成挂起位置，就绪后自己落
         }
         return fresh;

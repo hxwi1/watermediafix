@@ -376,6 +376,13 @@ public final class MediaFix {
                 : "[mediafix] 本次播放: 状态=" + e.state() + " 位置=" + e.timeMs() + "ms"
                         + " | seek 执行 " + e.seekCount() + " 次，忽略原地 seek " + e.ignoredSeekCount()
                         + " 次（每次忽略都省下一次重开连接+清空音频缓冲）");
+        if (e != null && e.liveSession()) {
+            long latency = e.liveLatencyMs();
+            sendSuccess(source, "[mediafix] 直播: 音视频同一条流（原画）"
+                    + " | 实时延迟 " + (latency < 0 ? "未锚定" : latency + "ms")
+                    + " | 时间轴 " + e.liveElapsedMs() + "ms（开播以来）"
+                    + " | seek/ABR 已停用，断流自动重连");
+        }
         return 1;
     }
 

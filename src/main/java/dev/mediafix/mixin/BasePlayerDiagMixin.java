@@ -39,6 +39,7 @@ public abstract class BasePlayerDiagMixin {
         String handoffVideo = DashHandoff.takeVideo();
         String handoffAudio = DashHandoff.takeAudio();
         String resultAudio = DashHandoff.takeResultAudio();
+        boolean liveSession = DashHandoff.takeLive();   // 直播：seek/ABR/重连行为都不同
         DashHandoff.clear();
 
         // ---------- 1) 自研引擎 ----------
@@ -50,9 +51,11 @@ public abstract class BasePlayerDiagMixin {
 
                 // 关键：解析发生在别的线程、而且结果可能被 watermedia 缓存命中，
                 // 这时上面的线程内交接棒是空的 —— 按"播放器拿到的 URI"反查两条链。
-                if (videoUri == null || providedAudio == null) {
-                    var pair = DashHandoff.lookup(mrl.toString());
-                    if (pair != null) {
+                // 直播标记同理（它也只在解析线程的交接棒里），所以要一并从全局表补上。
+                var pair = DashHandoff.lookup(mrl.toString());
+                if (pair != null) {
+                    if (!liveSession && pair.live()) liveSession = true;
+                    if (videoUri == null || providedAudio == null) {
                         if (videoUri == null) videoUri = mediafix$parse(pair.video());
                         if (providedAudio == null) providedAudio = mediafix$parse(pair.audio());
                         MediaFix.LOGGER.info("[mediafix] 由全局交接表取回两条链: video={} audio={}",
@@ -62,7 +65,7 @@ public abstract class BasePlayerDiagMixin {
                 if (videoUri == null) videoUri = mrl;
                 URI audioUri = MediaEngines.resolveAudioUri(videoUri, providedAudio);
 
-                if (MediaEngines.create(this, videoUri, audioUri, FfmpegSources.buildHeaders(videoUri)) != null) {
+                if (MediaEngines.create(this, videoUri, audioUri, FfmpegSources.buildHeaders(videoUri), liveSession) != null) {
                     MediaFix.LOGGER.info("[mediafix] 自研引擎接管播放: video={} audio={}",
                     MediaFix.LOGGER.url(videoUri), MediaFix.LOGGER.url(audioUri));
                     return true;   // 告诉上游"开播成功"，但 VLC 不再参与

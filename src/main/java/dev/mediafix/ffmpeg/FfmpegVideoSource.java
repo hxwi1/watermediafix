@@ -123,6 +123,9 @@ public final class FfmpegVideoSource implements AutoCloseable {
     private volatile long seekTargetMs = -1L;
     /** "就地快进"的目标时间戳：早于它的帧直接丢弃（-1 = 不丢弃）。 */
     private volatile long skipBeforeMs = -1L;
+    /** 是否是直播流（直播没有可跳位置，禁止任何 seek 自愈）。 */
+    private volatile boolean liveStream;
+
     /** 渲染线程最近一次取帧时用的时钟（毫秒）。解码线程用它限制"解码领先量"。 */
     private volatile long lastClockMs;
     /** 最近一次取帧的时间（用来判断还有没有人在渲染）。 */
@@ -389,6 +392,11 @@ public final class FfmpegVideoSource implements AutoCloseable {
     }
 
     /** 渲染线程设置暂停意图：暂停时解码线程等待，不跑帧。 */
+    /** 标记这是一条直播流（由引擎在建源时告知）：关闭 seek 相关的自愈与对齐逻辑。 */
+    public void setLive(boolean live) {
+        this.liveStream = live;
+    }
+
     public void setPaused(boolean paused) {
         if (this.paused == paused) return;
         this.paused = paused;
@@ -515,6 +523,14 @@ public final class FfmpegVideoSource implements AutoCloseable {
      */
     private void evalDesync(long clockMs, long minPts, Slot presented) {
         if (clockMs <= 0) return;
+        /*
+         * 直播不做"按时钟重新对齐"。
+         *
+         * 这条自愈是给点播准备的：脱节时 seek 回时钟位置就恢复了。但直播没有可跳位置 ——
+         * 真去 avformat_seek_file 只会把直播流拉断。直播落后时正确做法是丢帧往前追
+         * （acquire 的"只丢过期帧"已经在做），真断了由引擎的断流重连接管。
+         */
+        if (this.liveStream) return;
         long now = System.currentTimeMillis();
 
         int sign = 0;

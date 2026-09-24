@@ -98,13 +98,43 @@ public final class MediaEngine implements AutoCloseable {
      * @param headers  给 FFmpeg 的请求头（Referer/Cookie 等）
      */
     public MediaEngine(URI videoUri, URI audioUri, String headers) {
+        this(videoUri, audioUri, headers, false);
+    }
+
+    /**
+     * @param live 本次会话是不是 B 站直播。直播和点播的播放模型不同：
+     *             没有可跳位置（seek 全部忽略）、没有清晰度阶梯（ABR 不参与）、
+     *             断流要主动重连、时间轴要用系统时间锚定（见 {@link #liveLatencyMs()}）。
+     */
+    public MediaEngine(URI videoUri, URI audioUri, String headers, boolean live) {
         this.videoUri = videoUri;
         this.audioUri = audioUri;
         this.headers = headers;
+        this.liveSession = live;
         // 原始两条链：ABR 换档会改 currentUri，所以"同源判定"必须用这两个
         this.originVideoUri = videoUri;
         this.originAudioUri = audioUri;
     }
+
+    /** 本次会话是否是直播（由解析阶段经 DashHandoff 传进来）。 */
+    private final boolean liveSession;
+
+    /*
+     * ---- 直播专用状态 ----
+     *
+     * 直播流的时间戳是服务器侧的一个固定偏移（实测约等于"本地零点起的毫秒数"），
+     * 且与系统时间 1:1 同步：8 秒窗口内「原始 PTS − 系统时间」只在 ±50ms 内浮动（约 6ppm）；
+     * 断流后重新取链，两段流的该偏移也只差 0.45s。
+     * 于是只要测一次锚点 liveAnchorMs = 原始PTS − 系统时间，就能：
+     *   ① 把巨大的原始 PTS 折算成"开播以来的秒数"（可读的位置）；
+     *   ② 算出实时延迟（我们播到的位置比"现在"落后多少）——liveLatencyMs()；
+     *   ③ 断流重连后**沿用同一个锚点**，新流自然接在原来那根时间轴上（连续，不跳）。
+     */
+    private volatile long liveAnchorMs;
+    private volatile long liveOpenWallMs;
+    private volatile long lastLiveReconnectAt;
+    private volatile long lastLiveFailLogAt;
+    private volatile long lastLiveSeekLogAt;
 
     /** 最初请求的两条链（ABR 换档不改动，用于识别"同一个视频的引擎"）。 */
     private final URI originVideoUri;
@@ -130,6 +160,7 @@ public final class MediaEngine implements AutoCloseable {
         try {
             if (this.videoUri != null) {
                 this.video = new FfmpegVideoSource(this.videoUri, this.headers);
+            this.video.setLive(this.liveSession);
                 this.currentVideoUri = this.videoUri;
                 this.video.start();
             }
@@ -338,6 +369,23 @@ public final class MediaEngine implements AutoCloseable {
                 // 主时钟 = 这批音频播完时的"可听位置"（批末尾 PTS 减去还在设备缓冲里的量）
                 long audibleMs = lastEnd - this.sink.pendingMs();
                 this.clock.update(audibleMs / 1000.0, false);
+
+                /*
+                 * 直播：用系统时间锚定时间轴（只需测一次）。
+                 *
+                 * 实测直播流的时间戳与系统时间 1:1 同步（8 秒窗口漂移约 6ppm），
+                 * 所以「原始 PTS − 系统时间」是个稳定常量。记下它之后：
+                 *   · 可读位置 = 原始PTS − (锚点 + 开播墙钟)  → "开播以来多少秒"
+                 *   · 实时延迟 = (现在 + 锚点) − 当前播放位置 → 落后直播边缘多少毫秒
+                 *   · 断流重连沿用同一锚点 → 新流自然接在原来的时间轴上，不跳
+                 * 点播完全不走这条路径。
+                 */
+                if (this.liveSession && this.liveAnchorMs == 0L && this.state == State.PLAYING) {
+                    this.liveAnchorMs = audibleMs - System.currentTimeMillis();
+                    this.liveOpenWallMs = System.currentTimeMillis();
+                    MediaFix.LOGGER.info("[mediafix] 直播时间轴锚定: 锚点={}ms（原始PTS=系统时间+锚点，实测 1:1 同步）",
+                            this.liveAnchorMs);
+                }
 
                 /*
                  * 缓冲回填：把冻结的时钟重新开起来。
@@ -552,14 +600,16 @@ public final class MediaEngine implements AutoCloseable {
                 MediaFix.LOGGER.info("[mediafix] 无缝换链（视频）开始 -> {} @ {}ms",
                         MediaFix.LOGGER.url(newUri), pos);
                 fresh = new FfmpegVideoSource(newUri, this.headers);
+                fresh.setLive(this.liveSession);
                 final FfmpegVideoSource probe = fresh;
                 fresh.start();
                 if (!awaitReady(() -> probe.isReady() || probe.isBroken(), 15000L)) {
                     MediaFix.LOGGER.warn("[mediafix] 换链放弃：新视频链 15 秒内未就绪");
                     return;
                 }
-                // 定位到"此刻正在播的位置"再等它出帧：这样切过去是连续的
-                fresh.requestSeek(Math.max(0L, timeMs()));
+                // 定位到"此刻正在播的位置"再等它出帧：这样切过去是连续的。
+                // 直播例外：直播流本来就没有可跳位置，打开即位于直播边缘。
+                if (!this.liveSession) fresh.requestSeek(Math.max(0L, timeMs()));
                 if (!awaitReady(() -> probe.framesProduced() > 0 || probe.isBroken(), 8000L)) {
                     MediaFix.LOGGER.warn("[mediafix] 换链放弃：新视频链 8 秒内未解出帧");
                     return;
@@ -622,7 +672,8 @@ public final class MediaEngine implements AutoCloseable {
                     return;
                 }
                 fresh.start(Math.max(1, ch), Math.max(8000, rate));
-                fresh.requestSeek(Math.max(0L, timeMs()));
+                // 直播不 seek：新流打开即位于直播边缘（寻求时长轴锚点保证接续连续）
+                if (!this.liveSession) fresh.requestSeek(Math.max(0L, timeMs()));
                 // 等它攒出一点音频再换，避免中间出现空档
                 if (!awaitReady(() -> probe.bufferedMs() > 400L || probe.isBroken(), 10000L)) {
                     MediaFix.LOGGER.warn("[mediafix] 换链放弃：新音频链 10 秒内未攒够缓冲");
@@ -696,6 +747,20 @@ public final class MediaEngine implements AutoCloseable {
     }
 
     public void seek(long ms) {
+        /*
+         * 直播没有可跳位置：任何 seek 都必须忽略。
+         *
+         * waterframes 的进度同步与暂停同步都会发 seekTo(...)，对直播来说这些全是无效动作 ——
+         * 真去 avformat_seek_file 会把直播流拉断（轻则停几秒，重则整条链失效）。
+         */
+        if (this.liveSession) {
+            long now = System.currentTimeMillis();
+            if (now - this.lastLiveSeekLogAt > 10_000L) {
+                this.lastLiveSeekLogAt = now;
+                MediaFix.LOGGER.info("[mediafix] 直播：忽略一次 seek -> {}ms（直播没有可跳位置）", ms);
+            }
+            return;
+        }
         long target = Math.max(0L, ms);
         // 引擎还没 boot（比如 ABR 刚换完档就 seek）：先记下，等两个源就绪再落
         if (this.video == null) this.pendingSeekMs = target;
@@ -990,7 +1055,30 @@ public final class MediaEngine implements AutoCloseable {
     }
 
     public boolean isLive() {
-        return this.durationMs <= 0L;
+        return this.liveSession || this.durationMs <= 0L;
+    }
+
+    /** 明确由解析阶段标记的直播会话（duration 判定可能被未知时长的点播误触发，所以分开暴露）。 */
+    public boolean liveSession() {
+        return this.liveSession;
+    }
+
+    /**
+     * 直播实时延迟（毫秒）：此刻播出来的内容比"现在"落后多少。负数或 -1 表示未知/非直播。
+     *
+     * <p>推导：原始 PTS 与系统时间的关系是 {@code pts(t) = wall(t) + liveAnchorMs}，
+     * 所以当前播放位置对应的墙钟时间 = {@code timeMs() - liveAnchorMs}，
+     * 它离"现在"的距离就是延迟（含解码缓冲与声卡缓冲，也就是耳朵真正听到的延迟）。
+     */
+    public long liveLatencyMs() {
+        if (!this.liveSession || this.liveAnchorMs == 0L) return -1L;
+        return (System.currentTimeMillis() + this.liveAnchorMs) - timeMs();
+    }
+
+    /** 时间轴上"开播以来"的位置（毫秒）；直播未锚定时返回 -1。 */
+    public long liveElapsedMs() {
+        if (!this.liveSession || this.liveAnchorMs == 0L) return -1L;
+        return timeMs() - (this.liveAnchorMs + this.liveOpenWallMs);
     }
 
     public long timeMs() {
@@ -1021,7 +1109,17 @@ public final class MediaEngine implements AutoCloseable {
         if (isBroken()) return false;
         if (this.video != null && !this.video.isReady()) return false;
         if (this.audio != null && !this.audio.isReady() && !this.audio.isBroken()) return false;
-        if (durationMs() <= 0) return false;
+        /*
+         * 时长未知就还不算就绪 —— 这是给点播准备的（waterframes 一旦认为就绪就会固定一次
+         * tickMax，时长没来时固定成 0，进度条就永久停在 0）。
+         *
+         * ★ 但直播必须放行：直播的 duration 天生是 -1（没有结尾）。这里以前无条件拦，
+         * 结果 isReady() 恒为 false → waterframes 的 canRender() 恒为 false → 画面永远不渲染，
+         * 而音频链是独立的，于是表现就是"只有声音没有画面"（实测日志里
+         * canRender=false … 引擎就绪可显示=false 一直刷）。
+         * 直播本来就不显示进度条，所以"等时长"这条约束对它没有意义。
+         */
+        if (durationMs() <= 0 && !this.liveSession) return false;
         // 刻意不看 audioPrebuffered()：预缓冲只决定"状态"，绝不能决定"能不能渲染"。
         // 曾经这里返回 false 导致 waterframes 不再调 preRender → 渲染线程不再取帧 →
         // 帧环被 4 帧占满 → 解码线程阻塞 → 画面永久冻结。
@@ -1086,7 +1184,13 @@ public final class MediaEngine implements AutoCloseable {
         this.diagAt = now;
         abrTick();
         refreshLinkIfExpiring();
+        liveReconnectTick();
         if (!FfmpegConfig.verbose && this.diagCount++ > 400) return;   // 非 verbose 打约 13 分钟
+        if (this.liveSession) {
+            MediaFix.LOGGER.diag("[mediafix][直播] 时间轴={}ms（开播以来）实时延迟={}ms 锚点={}ms | 原始PTS={}ms 系统时间={}ms",
+                    liveElapsedMs(), liveLatencyMs(), this.liveAnchorMs, timeMs(),
+                    System.currentTimeMillis() + this.liveAnchorMs);
+        }
         MediaFix.LOGGER.diag("[mediafix][引擎] 状态={} 时钟={}ms 时长={}ms 暂停意图={} 视频:就绪={} 坏={} 解出={}帧 已显示={}帧 归还入={} 已归还={} 丢帧={} 帧队列={} 预读={}KB 末帧PTS={} 音频:就绪={} 待播={}ms 音频环={}ms 门限={}ms 提前量={}ms",
                 this.state, timeMs(), durationMs(), this.wantPause,
                 this.video != null && this.video.isReady(), this.video != null && this.video.isBroken(),
@@ -1190,8 +1294,41 @@ public final class MediaEngine implements AutoCloseable {
      * ABR 心跳（跟随两秒一次的诊断一起跑）：喂带宽采样 → 让控制器决策 → 需要就换档。
      * 只在 {@code maxQn == -1}（/mediafix-stream quality auto）时工作；手动指定档位时绝不干预。
      */
+    /**
+     * 直播断流重连。
+     *
+     * <p>直播流迟早会被掐（CDN 换节点、主播重推、URL 到期…），表现为 EOF 或读取失败。
+     * 点播遇到这种情况就是"播完了"，直播则必须重新取链接着播 ——
+     * 这里复用点播的续期路径（{@code reResolveUrls} + 无缝换链），所以声卡、时钟、
+     * 播放状态都不重置，而且因为沿用同一个时间轴锚点，新流会接在正确的位置上。
+     */
+    private void liveReconnectTick() {
+        if (!this.liveSession || this.closed || this.video == null) return;
+        long now = System.currentTimeMillis();
+        if (now - this.lastLiveReconnectAt < 5000L) return;
+        boolean vCut = this.video.isBroken() || this.video.isEnded();
+        boolean aCut = this.audio != null && (this.audio.isBroken() || this.audio.isEnded());
+        if (!vCut && !aCut) return;
+        this.lastLiveReconnectAt = now;
+        MediaFix.LOGGER.warn("[mediafix] 直播断流（视频坏={} 播完={} 音频坏={}）：重新取链重连（延迟 {}ms）",
+                this.video.isBroken(), this.video.isEnded(),
+                this.audio != null && this.audio.isBroken(), liveLatencyMs());
+        String[] fresh = dev.mediafix.proxy.DashResolver.reResolveUrls();
+        if (fresh == null || fresh[0] == null || fresh[1] == null) {
+            // 主播下播时也会走到这里（接口报未开播）——失败日志限流，别每 5 秒刷一行
+            if (now - this.lastLiveFailLogAt > 30_000L) {
+                this.lastLiveFailLogAt = now;
+                MediaFix.LOGGER.warn("[mediafix] 直播重连没成功（可能已下播或需要权限），稍后自动再试");
+            }
+            return;
+        }
+        reloadVideoSource(URI.create(fresh[0]));
+        reloadAudioSource(URI.create(fresh[1]));
+    }
+
     private void abrTick() {
-        if (StreamConfig.maxQn >= 0 || this.closed || this.rebufferHold) return;
+        // 直播不参与 ABR：切档必须断流重连，体验反而更差（固定原画）
+        if (this.liveSession || StreamConfig.maxQn >= 0 || this.closed || this.rebufferHold) return;
         FfmpegVideoSource v = this.video;
         if (v == null) return;
         long rate = v.readBytesPerSec();

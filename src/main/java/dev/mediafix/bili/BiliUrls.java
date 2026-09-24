@@ -21,6 +21,10 @@ public final class BiliUrls {
     private static final Pattern PAGE = Pattern.compile("[?&]p=([0-9]+)");
     private static final Pattern EP = Pattern.compile("/ep([0-9]+)");
     private static final Pattern SS = Pattern.compile("/ss([0-9]+)");
+    /** 直播间：live.bilibili.com/<房间号>，也兼容 /blanc/、/h5/ 前缀。 */
+    private static final Pattern LIVE_ROOM = Pattern.compile("live\\.bilibili\\.com/(?:blanc/|h5/)?([0-9]+)");
+    /** 直播间：?room_id=<房间号>（部分分享链接是这种形式）。 */
+    private static final Pattern LIVE_ROOM_Q = Pattern.compile("[?&]room_id=([0-9]+)");
 
     private static final String[] HOSTS = {
             "bilibili.com", "www.bilibili.com", "m.bilibili.com", "live.bilibili.com", "b23.tv"
@@ -61,6 +65,16 @@ public final class BiliUrls {
             }
         }
         return 1;
+    }
+
+    /**
+     * 直播间链接 → 房间号；非直播间链接返回 null。
+     * 直播和点播是两套完全不同的接口，这里只负责把房间号拿出来。
+     */
+    public static Long liveRoomId(String url) {
+        if (url == null) return null;
+        Long id = matchNumber(LIVE_ROOM, url);
+        return id != null ? id : matchNumber(LIVE_ROOM_Q, url);
     }
 
     public static Long epId(String url) {

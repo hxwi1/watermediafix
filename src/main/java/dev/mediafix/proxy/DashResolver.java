@@ -11,6 +11,7 @@ import dev.mediafix.config.FfmpegConfig;
 import dev.mediafix.config.StreamConfig;
 import dev.mediafix.ffmpeg.FfmpegRuntime;
 import dev.mediafix.bili.BiliAuth;
+import dev.mediafix.bili.BiliLive;
 import dev.mediafix.bili.BiliUrls;
 import dev.mediafix.ui.Notice;
 import org.watermedia.api.network.patchs.AbstractPatch;
@@ -80,6 +81,11 @@ public final class DashResolver {
         lastResolvedUri = uri;
         try {
             URI longUri = BiliUrls.expandShortLink(uri);
+            // 直播：live.bilibili.com/<房间号> —— 和点播是完全不同的接口与播放模型
+            Long liveRoom = BiliUrls.liveRoomId(longUri.toString());
+            if (liveRoom != null) {
+                return resolveLive(liveRoom);
+            }
             // 番剧/大会员内容：ep 链接走 pgc 接口
             Long epId = parseEpId(longUri.toString());
             if (epId != null) {
@@ -106,6 +112,37 @@ public final class DashResolver {
             Notice.message("DASH 解析异常，回退原生播放: " + t.getMessage());
             return null;
         }
+    }
+
+    /**
+     * B 站直播：取 FLV 直链（原画），video 与 audio 都指向同一条流。
+     *
+     * <p>直播是"音视频复用"的单流（实测 FLV 里 aac + h264 共用一根时间轴），
+     * 而我们引擎的两条链本来就可以指向同一个 URI（音频源自己会挑音频轨），
+     * 所以这里两条链给同一个直链即可，不需要另找音轨接口。
+     *
+     * <p>时间轴用系统时间锚定，见 {@link dev.mediafix.engine.MediaEngine} 的直播锚点：
+     * 直播流的时间戳是服务器侧的固定偏移且与系统时间 1:1 同步，
+     * 于是"原始 PTS + 锚点"就能换算出实时延迟，断流重连也能无缝接上。
+     */
+    private static AbstractPatch.Result resolveLive(long roomId) {
+        BiliLive.Stream stream = BiliLive.resolve(roomId);
+        if (stream == null) {
+            // 未开播 / 付费直播 / 接口异常：交回前置模组，由它按自己的方式处理
+            Notice.message("B站直播解析失败（未开播或需要权限），回退原生播放");
+            return null;
+        }
+        // 直播标记必须同时进"线程内交接棒"和"按主 URI 的全局表"：
+        // 解析在 ImageFetch 线程、引擎在播放器线程创建，只存线程内会丢。
+        DashHandoff.set(stream.url(), stream.url(), true);
+        MediaFix.LOGGER.info("[mediafix] B站直播流式直连: 房间 {} qn={}（音视频同一条流，时间轴用系统时间锚定）",
+                roomId, stream.qn());
+        if (!refreshingSession) {
+            Notice.message("B站直播流式播放: 房间 " + roomId);
+        }
+        AbstractPatch.Result result = new AbstractPatch.Result(URI.create(stream.url()), true, false);
+        result.audioUrl = URI.create(stream.url());
+        return result;
     }
 
     /**
@@ -415,20 +452,27 @@ public final class DashResolver {
 
     /**
      * 从直链里取出 CDN 给的有效期（毫秒时间戳，0 = 未知）。
-     * B 站直链的查询串里带 {@code deadline=<秒>}，过期后请求会被拒。
+     *
+     * <p>点播直链带 {@code deadline=<秒>}，直播直链带 {@code expires=<秒>}（离线实测确认是复数形式），
+     * 含义相同 —— 三个都认，直播才能在到期前主动换链（长直播必然撞上 URL 过期）。
      */
     public static long urlDeadlineMs(String url) {
         if (url == null) return 0L;
-        int i = url.indexOf("deadline=");
-        if (i < 0) return 0L;
-        int end = i + 9;
-        while (end < url.length() && Character.isDigit(url.charAt(end))) end++;
-        try {
-            long sec = Long.parseLong(url.substring(i + 9, end));
-            return sec > 0 ? sec * 1000L : 0L;
-        } catch (Throwable t) {
-            return 0L;
+        for (String key : new String[]{"deadline=", "expires=", "expire="}) {
+            int i = url.indexOf(key);
+            if (i < 0) continue;
+            int start = i + key.length();
+            int end = start;
+            while (end < url.length() && Character.isDigit(url.charAt(end))) end++;
+            if (end == start) continue;
+            try {
+                long sec = Long.parseLong(url.substring(start, end));
+                if (sec > 0) return sec * 1000L;
+            } catch (Throwable ignored) {
+                // 试下一个 key
+            }
         }
+        return 0L;
     }
 
     /**

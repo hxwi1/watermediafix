@@ -16,8 +16,13 @@ public final class DashHandoff {
     /** NetworkAPI.patch 返回的 Result.audioUrl（下载模式下是本地 m4a，独立于流式交接棒）。 */
     private static final ThreadLocal<String> RESULT_AUDIO = new ThreadLocal<>();
 
-    /** 一个流式媒体的两条链。 */
-    public record Pair(String video, String audio, long at) {
+    /**
+     * 一个流式媒体的两条链。
+     *
+     * <p>{@code live} 必须一起存：解析跑在 ImageFetch 线程、引擎却在播放器线程创建，
+     * 线程内的交接棒传不过去，直播标记只能靠这张按主 URI 索引的全局表带到播放阶段。
+     */
+    public record Pair(String video, String audio, long at, boolean live) {
     }
 
     /**
@@ -44,15 +49,22 @@ public final class DashHandoff {
 
     /** 记录本次解析得到的直链（线程内 + 按主 URI 全局各存一份）。 */
     public static void set(String videoUrl, String audioUrl) {
+        set(videoUrl, audioUrl, false);
+    }
+
+    /** 记录本次解析得到的直链（线程内 + 按主 URI 全局各存一份），并带上直播标记。 */
+    public static void set(String videoUrl, String audioUrl, boolean live) {
         if (videoUrl != null && !videoUrl.isBlank()) lastVideo = videoUrl;
         VIDEO.set(videoUrl);
         AUDIO.set(audioUrl);
+        if (live) LIVE.set(true);
+        long now = System.currentTimeMillis();
         // 主 URI 就是播放器实际会拿到的那个：流式模式下是音频链，下载模式下是本地视频文件
         if (audioUrl != null && !audioUrl.isBlank()) {
-            BY_MAIN.put(audioUrl, new Pair(videoUrl, audioUrl, System.currentTimeMillis()));
+            BY_MAIN.put(audioUrl, new Pair(videoUrl, audioUrl, now, live));
         }
         if (videoUrl != null && !videoUrl.isBlank()) {
-            BY_MAIN.put(videoUrl, new Pair(videoUrl, audioUrl, System.currentTimeMillis()));
+            BY_MAIN.put(videoUrl, new Pair(videoUrl, audioUrl, now, live));
         }
         purgeExpired();
     }
@@ -88,6 +100,26 @@ public final class DashHandoff {
         return a;
     }
 
+    /*
+     * 本次解析是不是"B 站直播"。直播和点播在播放阶段的行为完全不同：
+     * 直播没有可跳位置（seek 必须忽略）、没有清晰度阶梯（ABR 不参与）、
+     * 断流要主动重新取链重连、并且要用系统时间折算实时延迟。
+     * 这些判断需要一条从解析阶段传到播放阶段的信号，所以放这里。
+     */
+    private static final ThreadLocal<Boolean> LIVE = new ThreadLocal<>();
+
+    /** 标记本次解析是直播。 */
+    public static void setLive(boolean live) {
+        LIVE.set(live);
+    }
+
+    /** 取走直播标记（取完即清）。 */
+    public static boolean takeLive() {
+        Boolean v = LIVE.get();
+        LIVE.remove();
+        return v != null && v;
+    }
+
     /** 记录解析结果里的独立音轨地址。 */
     public static void setResultAudio(String audioUrl) {
         if (audioUrl != null) RESULT_AUDIO.set(audioUrl);
@@ -105,5 +137,6 @@ public final class DashHandoff {
         VIDEO.remove();
         AUDIO.remove();
         RESULT_AUDIO.remove();
+        LIVE.remove();
     }
 }
