@@ -1,43 +1,79 @@
 package dev.mediafix.mixin;
 
 import dev.mediafix.MediaFix;
+import dev.mediafix.config.FfmpegConfig;
+import dev.mediafix.engine.MediaEngines;
+import dev.mediafix.ffmpeg.FfmpegRuntime;
+import dev.mediafix.ffmpeg.FfmpegSources;
+import dev.mediafix.proxy.DashHandoff;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.watermedia.videolan4j.player.base.MediaApi;
 
 import java.net.URI;
 import java.util.Arrays;
 
 /**
- * 音频桥（原诊断 Mixin 精简版）：BasePlayer.lambda$start$0 是 VLC 实际开播的地方。
- * watermedia 2.1.36 忽略 Result.audioUrl，而 B站 DASH 视频轨无声——这里从视频缓存
- * URL 推导配套音频文件（mediafix_*_v.mp4 → _a.m4a），以 ":input-slave" 选项
- * 挂给 VLC，实现视频+音频双轨合并播放。
+ * 播放入口：{@code BasePlayer.lambda$start$0} 是这个播放器真正"开播"的地方
+ * （解析完 URL 之后、调用 VLC 之前）。
  *
- * <p>注意：不要在此长期持有 MediaApi 引用或做延迟轮询——播放器被释放后
- * 原生结构体随即回收，事后访问会触发 JNA "Invalid memory access"，
- * 严重时直接进程级崩溃（已实测）。
+ * <p>这里做两件事：
+ * <ol>
+ *   <li><b>引擎优先</b>：启用 FFmpeg 时不再启动 VLC，改由自研引擎播放
+ *       （音视频各自解码 + 自有时钟）。VLC 只剩一个"挂着的空壳"，
+ *       因为 waterframes 有一处会直接摸 {@code raw()} 的状态。</li>
+ *   <li><b>VLC 兜底</b>：引擎不可用时走原路径，含 DASH 分轨的 {@code :input-slave} 音频桥。</li>
+ * </ol>
  */
 @Mixin(targets = "org.watermedia.api.player.videolan.BasePlayer")
 public abstract class BasePlayerDiagMixin {
-
-    @Inject(method = "lambda$start$0", at = @At("HEAD"))
-    private void mediafix$logStartThread(URI uri, String[] options, CallbackInfo ci) {
-        MediaFix.LOGGER.info("[mediafix][diag] VideoPlayer.start 线程执行: 入参uri={} 线程={}",
-                uri, Thread.currentThread().getName());
-    }
 
     @Redirect(
             method = "lambda$start$0",
             at = @At(value = "INVOKE",
                     target = "org/watermedia/videolan4j/player/base/MediaApi.play(Ljava/net/URI;[Ljava/lang/String;)Z")
     )
-    private boolean mediafix$logPlayAndAttachAudio(MediaApi api, URI mrl, String[] options) {
-        // DASH 音频桥：B站 DASH 视频流无声，从视频 URL 推导同缓存的音频文件
-        // (mediafix_<bvid>_<cid>_v.mp4 → _a.m4a)，以 ":input-slave" 选项挂给 VLC
+    private boolean mediafix$playViaEngineOrVlc(MediaApi api, URI mrl, String[] options) {
+        // 解析阶段放在线程内的交接棒：先取走，无论走哪条路都不留残留
+        String handoffVideo = DashHandoff.takeVideo();
+        String handoffAudio = DashHandoff.takeAudio();
+        String resultAudio = DashHandoff.takeResultAudio();
+        DashHandoff.clear();
+
+        // ---------- 1) 自研引擎 ----------
+        if (FfmpegRuntime.available()) {
+            try {
+                URI videoUri = mediafix$parse(handoffVideo);
+                URI providedAudio = mediafix$parse(handoffAudio);
+                if (providedAudio == null) providedAudio = mediafix$parse(resultAudio);
+
+                // 关键：解析发生在别的线程、而且结果可能被 watermedia 缓存命中，
+                // 这时上面的线程内交接棒是空的 —— 按"播放器拿到的 URI"反查两条链。
+                if (videoUri == null || providedAudio == null) {
+                    var pair = DashHandoff.lookup(mrl.toString());
+                    if (pair != null) {
+                        if (videoUri == null) videoUri = mediafix$parse(pair.video());
+                        if (providedAudio == null) providedAudio = mediafix$parse(pair.audio());
+                        MediaFix.LOGGER.info("[mediafix] 由全局交接表取回两条链: video={} audio={}",
+                                MediaFix.LOGGER.url(pair.video()), MediaFix.LOGGER.url(pair.audio()));
+                    }
+                }
+                if (videoUri == null) videoUri = mrl;
+                URI audioUri = MediaEngines.resolveAudioUri(videoUri, providedAudio);
+
+                if (MediaEngines.create(this, videoUri, audioUri, FfmpegSources.buildHeaders(videoUri)) != null) {
+                    MediaFix.LOGGER.info("[mediafix] 自研引擎接管播放: video={} audio={}",
+                    MediaFix.LOGGER.url(videoUri), MediaFix.LOGGER.url(audioUri));
+                    return true;   // 告诉上游"开播成功"，但 VLC 不再参与
+                }
+                MediaFix.LOGGER.warn("[mediafix] 引擎创建失败，回退 VLC 播放");
+            } catch (Throwable t) {
+                MediaFix.LOGGER.error("[mediafix] 引擎接管异常，回退 VLC 播放", t);
+            }
+        }
+
+        // ---------- 2) VLC 兜底（原逻辑：DASH 独立音轨用 input-slave 挂载） ----------
         URI audio = mediafix$deriveDashAudio(mrl);
         String[] finalOptions = options;
         if (audio != null) {
@@ -54,31 +90,39 @@ public abstract class BasePlayerDiagMixin {
             }
         }
         boolean ok = api.play(mrl, finalOptions);
-        MediaFix.LOGGER.info("[mediafix][diag] VLC play: mrl={} 返回={} options={} 线程={}",
-                mrl, ok, Arrays.toString(finalOptions), Thread.currentThread().getName());
+        MediaFix.LOGGER.info("[mediafix] VLC 播放: mrl={} 返回={}", mrl, ok);
         return ok;
     }
 
+    private static URI mediafix$parse(String s) {
+        if (s == null || s.isBlank()) return null;
+        try {
+            return URI.create(s);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     /**
-     * 从 DASH 缓存视频 URL 推导配套音频文件 URL：
-     * {@code .../download?file=mediafix_<bvid>_<cid>_v.mp4} →
-     * {@code .../download?file=mediafix_<bvid>_<cid>_a.m4a}。
-     * 本地音频文件存在才返回（下载完成才可能有声），否则返回 null。
+     * 为"本地成对文件"推导配套音频的 URI：{@code xxx_v.mp4} → 同目录的 {@code xxx_a.m4a}。
+     *
+     * <p>流式直连时音频链由 DashResolver 的 {@code result.audioUrl} 直接给出，不走这里；
+     * 这里只服务于玩家放在本地的成对文件（他们自己的素材）。
      */
     private static URI mediafix$deriveDashAudio(URI mrl) {
         try {
-            String s = mrl.toString();
-            int i = s.indexOf("file=mediafix_");
-            if (i < 0 || !s.endsWith("_v.mp4")) {
+            if (!mrl.toString().endsWith("_v.mp4")) {
                 return null;
             }
-            String vName = s.substring(i + "file=".length());
-            String aName = vName.substring(0, vName.length() - "_v.mp4".length()) + "_a.m4a";
-            if (!java.nio.file.Files.exists(
-                    dev.polaris_light.bilibili_media.util.BilibiliMediaUtil.getDownloadPath().resolve(aName))) {
-                return null;
+            if ("file".equalsIgnoreCase(mrl.getScheme())) {
+                java.nio.file.Path video = java.nio.file.Path.of(mrl);
+                String fileName = video.getFileName().toString();
+                String aName = fileName.substring(0, fileName.length() - "_v.mp4".length()) + "_a.m4a";
+                java.nio.file.Path audio = video.resolveSibling(aName);
+                if (!java.nio.file.Files.exists(audio)) return null;
+                return audio.toUri();
             }
-            return URI.create(s.substring(0, i + "file=".length()) + aName);
+            return null;
         } catch (Throwable t) {
             return null;
         }

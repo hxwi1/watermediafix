@@ -47,7 +47,7 @@ public abstract class DynamicTextureDiagMixin {
             String tname = Thread.currentThread().getName();
             if (onRender) {
                 if (SEEN_CTOR_RENDER.add(tname)) {
-                    MediaFix.LOGGER.info("[mediafix][diag] DynamicTexture ctor ON-render thread={} size={}x{} caller={}",
+                    MediaFix.LOGGER.diag("[mediafix][diag] DynamicTexture ctor ON-render thread={} size={}x{} caller={}",
                             tname,
                             pixels == null ? -1 : pixels.getWidth(),
                             pixels == null ? -1 : pixels.getHeight(),
@@ -57,7 +57,7 @@ public abstract class DynamicTextureDiagMixin {
             }
             String sig = tname + " | " + callerSig(3);
             if (SEEN_CTOR_WORKER.add(sig)) {
-                MediaFix.LOGGER.warn("[mediafix][diag] !!! DynamicTexture ctor OFF-render thread={} size={}x{} caller={}",
+                MediaFix.LOGGER.diag("[mediafix][diag] !!! DynamicTexture ctor OFF-render thread={} size={}x{} caller={}",
                         tname,
                         pixels == null ? -1 : pixels.getWidth(),
                         pixels == null ? -1 : pixels.getHeight(),
@@ -73,7 +73,7 @@ public abstract class DynamicTextureDiagMixin {
         try {
             String sig = Thread.currentThread().getName() + " | " + callerSig(3);
             if (SEEN_CLOSE.add(sig)) {
-                MediaFix.LOGGER.warn("[mediafix][diag] DynamicTexture closed thread={} caller={}",
+                MediaFix.LOGGER.diag("[mediafix][diag] DynamicTexture closed thread={} caller={}",
                         Thread.currentThread().getName(), callerSig(3));
             }
         } catch (Throwable ignored) {

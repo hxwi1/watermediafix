@@ -23,12 +23,14 @@ public abstract class NetworkApiDiagMixin {
             method = "patch(Ljava/net/URI;)Lorg/watermedia/api/network/patchs/AbstractPatch$Result;",
             at = @At("RETURN")
     )
-    private void mediafix$logPatch(URI uri, CallbackInfoReturnable<AbstractPatch.Result> cir) {
+    private static void mediafix$logPatch(URI uri, CallbackInfoReturnable<AbstractPatch.Result> cir) {
         AbstractPatch.Result r = cir.getReturnValue();
         if (r != null && r.audioUrl != null) {
             DashAudioBridge.set(r.audioUrl);
+            // 自研引擎要用它当音频链（下载模式下是本地 m4a）
+            dev.mediafix.proxy.DashHandoff.setResultAudio(r.audioUrl.toString());
         }
-        MediaFix.LOGGER.info("[mediafix][diag] NetworkAPI.patch: in={} out={} audio={} 线程={}",
+        MediaFix.LOGGER.diag("[mediafix][diag] NetworkAPI.patch: in={} out={} audio={} 线程={}",
                 uri,
                 r == null ? "null" : r.uri,
                 r == null || r.audioUrl == null ? "-" : r.audioUrl,

@@ -19,6 +19,10 @@ public abstract class VideoPlayerVolumeMixin {
 
     @ModifyVariable(method = "setVolume(I)V", at = @At("HEAD"), index = 1, require = 1)
     private int mediafix$syncMasterVolume(int volume) {
+        // 自研引擎接管时，主音量统一在引擎的音频输出里乘一次，这里必须让位（否则双乘）
+        if (dev.mediafix.engine.MediaEngines.of((Object) this) != null) {
+            return volume;
+        }
         Minecraft mc = Minecraft.getInstance();
         if (mc == null || mc.options == null) {
             return volume;

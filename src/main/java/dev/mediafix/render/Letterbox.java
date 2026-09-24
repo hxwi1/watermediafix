@@ -19,8 +19,13 @@ import java.util.Map;
  */
 public final class Letterbox {
 
-    private static final int MAX_CANVAS = 8;
+    private static final int MAX_CANVAS = 4;
     private static final int MAX_SIDE = 8192;
+    /**
+     * 单块画布的最大像素数。4K(3840x2160) = 829 万，1:1 的屏幕格要 1475 万 ——
+     * 取 1600 万，保证 4K 视频在非 16:9 的屏幕格上也能加黑边（原先是 838 万，4K 上会退化成拉伸）。
+     */
+    private static final long MAX_CANVAS_PIXELS = 16L * 1024 * 1024;
 
     private Letterbox() {
     }
@@ -31,16 +36,31 @@ public final class Letterbox {
      */
     public static void upload(ByteBuffer data, int texId, int format,
                               int w, int h, boolean full) {
-        float aspect = LetterboxState.aspect();
-        if (aspect <= 0.05f || !Float.isFinite(aspect) || w <= 0 || h <= 0
-                || w > MAX_SIDE || h > MAX_SIDE) {
+        Canvas c = prepare(data, w, h);
+        if (c == null) {
             RenderAPI.uploadBuffer(data, texId, format, w, h, full);
             return;
         }
+        boolean needFull = full || c.paintedNow;
+        RenderAPI.uploadBuffer(c.buf, texId, format, c.w, c.h, needFull);
+    }
+
+    /**
+     * 信箱化准备（两种播放路径共用）：
+     * 把视频帧居中拷进一块"与屏幕格等比"的黑色画布，返回画布；不需要处理时返回 null（原样上传）。
+     *
+     * <p>自研引擎的上传路径（GlSafeUpload）也走这里，否则引擎接管后画面会被拉伸 ——
+     * 信箱化是绑在 watermedia 的 RenderAPI 上传点上的，换上传实现就会丢掉。
+     */
+    public static Canvas prepare(ByteBuffer data, int w, int h) {
+        float aspect = LetterboxState.aspect();
+        if (aspect <= 0.05f || !Float.isFinite(aspect) || w <= 0 || h <= 0
+                || w > MAX_SIDE || h > MAX_SIDE) {
+            return null;
+        }
         float videoAspect = (float) w / (float) h;
         if (Math.abs(videoAspect - aspect) <= aspect * 0.01f) {
-            RenderAPI.uploadBuffer(data, texId, format, w, h, full);
-            return;
+            return null;   // 比例已经一致，不必加黑边
         }
 
         // 等比画布：包住视频且比例等于屏幕比例
@@ -52,9 +72,8 @@ public final class Letterbox {
             ch = h;
             cw = Math.max(w, Math.round(h * aspect));
         }
-        if (cw > MAX_SIDE || ch > MAX_SIDE || (long) cw * ch > 32L * 1024 * 1024 / 4) {
-            RenderAPI.uploadBuffer(data, texId, format, w, h, full);
-            return;
+        if (cw > MAX_SIDE || ch > MAX_SIDE || (long) cw * ch > MAX_CANVAS_PIXELS) {
+            return null;
         }
 
         Canvas c = CANVASES.get(key(cw, ch));
@@ -65,14 +84,15 @@ public final class Letterbox {
             c = new Canvas(cw, ch);
             CANVASES.put(key(cw, ch), c);
         }
-        boolean needFull = full || c.lastVw != w || c.lastVh != h;
+        c.paintedNow = false;
         if (c.lastVw != w || c.lastVh != h) {
             c.paintBlack(); // 视频尺寸变了，黑边里可能有旧画面残留
             c.lastVw = w;
             c.lastVh = h;
+            c.paintedNow = true;
         }
 
-        // 逐行居中拷贝（4字节/像素，格式由 RenderAPI 处理）
+        // 逐行居中拷贝（4字节/像素）
         int srcPos = data.position();
         int srcLimit = data.limit();
         int srcStride = w * 4;
@@ -80,16 +100,13 @@ public final class Letterbox {
         int barTop = (ch - h) / 2;
         int barLeft = (cw - w) / 2;
         int dstBase = (barTop * cw + barLeft) * 4;
-        // 防御：源缓冲装不下整帧（包装后分辨率与实际帧缓冲不匹配时会出现
-        // limit - position < w*4 的截断缓冲，如重连/Display 重建瞬间）。
-        // 此时按 watermedia 原语义整幅透传，确保任何一帧异常都绝不让
-        // lambda$display$0 抛异常把 semaphore 卡死(表现为播一秒后黑屏)。
+        // 防御：源缓冲装不下整帧（重连/Display 重建瞬间出现截断缓冲）时原样透传，
+        // 任何一帧异常都不许把上传路径抛异常卡死。
         long srcBytes = (long) srcLimit - srcPos;
         if (srcStride <= 0 || srcBytes < (long) h * srcStride
                 || (long) dstBase + (long) (h - 1) * dstStride + (long) srcStride
                         > (long) c.buf.capacity()) {
-            RenderAPI.uploadBuffer(data, texId, format, w, h, full);
-            return;
+            return null;
         }
         try {
             for (int row = 0; row < h; row++) {
@@ -99,13 +116,11 @@ public final class Letterbox {
             }
         } catch (RuntimeException ex) {
             data.position(srcPos).limit(srcLimit);
-            RenderAPI.uploadBuffer(data, texId, format, w, h, full);
-            return;
+            return null;
         }
         data.position(srcPos).limit(srcLimit);
         c.buf.clear();
-
-        RenderAPI.uploadBuffer(c.buf, texId, format, cw, ch, needFull);
+        return c;
     }
 
     /** 画布缓存：尺寸 -> 画布（渲染线程独占访问）。 */
@@ -116,12 +131,14 @@ public final class Letterbox {
     }
 
     /** 画布：复用的直接缓冲 + 上次视频尺寸（变化时需重涂黑边并整幅上传）。 */
-    private static final class Canvas {
-        final ByteBuffer buf;
-        final int w;
-        final int h;
+    public static final class Canvas {
+        public final ByteBuffer buf;
+        public final int w;
+        public final int h;
         int lastVw = -1;
         int lastVh = -1;
+        /** 本帧是否重新涂过黑边（需要整幅上传）。 */
+        boolean paintedNow;
 
         Canvas(int w, int h) {
             this.w = w;

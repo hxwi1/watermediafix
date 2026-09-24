@@ -31,7 +31,7 @@ public abstract class DisplayTileDiagMixin {
             return;
         }
         mediafix$lastLog = now;
-        MediaFix.LOGGER.info("[mediafix][diag] requestDisplay: display={} cacheStatus={} cacheVideo={} cacheUri={}",
+        MediaFix.LOGGER.diag("[mediafix][diag] requestDisplay: display={} cacheStatus={} cacheVideo={} cacheUri={}",
                 display == null ? "未创建" : "已存在",
                 imageCache == null ? "无缓存" : imageCache.getStatus(),
                 imageCache != null && imageCache.isVideo(),

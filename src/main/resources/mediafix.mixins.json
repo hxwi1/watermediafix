@@ -4,7 +4,6 @@
   "required": false,
   "package": "dev.mediafix.mixin",
   "client": [
-    "SimpleFileServerMixin",
     "VideoPlayerMixin",
     "WaterframesSeekGuardMixin",
     "PanoramicAudioMixin",
@@ -19,10 +18,11 @@
     "NetworkApiDiagMixin",
     "VlcLogMixin",
     "DisplayAspectMixin",
-    "GlStateManagerAccessor",
-    "TextureStateAccessor",
     "DynamicTextureDiagMixin",
-    "DynamicTextureSafetyMixin"
+    "DynamicTextureSafetyMixin",
+    "BasePlayerFfmpegMixin",
+    "VideoPlayerFfmpegMixin",
+    "DisplayFfmpegMixin"
   ],
   "injectors": {
     "defaultRequire": 1

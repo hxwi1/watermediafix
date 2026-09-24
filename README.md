@@ -2,19 +2,18 @@
 
 > **本 Mod 是专门给服务器做的** —— 供连入固定服务器的玩家在客户端安装使用，用于把 B 站视频稳定地投放到服务器里的水帧（WaterFrames）观影屏幕上。
 >
-> ⚠️ **版本依赖固定**：本 Mod 依赖 **固定版本**的播放器前置 mod 与依赖库，请严格按下表版本安装，**勿随意升级**，否则 Mixin 注入目标会失配导致崩溃或黑屏。
+> ⚠️ **版本依赖固定**：本 Mod 依赖 **固定版本**的播放器前置 mod，请严格按下表版本安装，**勿随意升级**，否则 Mixin 注入目标会失配，导致崩溃或黑屏。
 
 ---
 
 ## 说明
 
-MediaFix 是一个**纯客户端**修复/增强 mod，通过 **Mixin 注入**修复并增强 **WaterFrames** + **Bilibili-Media-Mod** 在服务器观影场景下的若干问题，不改动原 mod 的任何源码。
+MediaFix 是一个**纯客户端**修复/增强 mod。它通过 **Mixin 注入**，把 WaterFrames + WaterMedia 的播放链路整体换成**自研 FFmpeg DASH 流式引擎**，**不改动任何前置 mod 的源码**。
 
-- **只装客户端**：本 mod 与放视频的 WaterFrames 方块同装于玩家客户端，服务端无需任何前置。
-- **给服务器用**：针对多人联机播放场景专门调优（随机端口避免冲突、服务端停止自动关闭代理等）。
-- **登录安全**：沿用 bilibili_media 的 `/bilimedia login` 扫码登录来拿高清直链，本 mod 做 Cookie 权限收紧与防泄露提示。
-
-本 Mod 是**纯客户端附属修复**，与服务器端逻辑无耦合，但为服务端观影体验而开发。
+- **只装客户端**：与放视频的 WaterFrames 方块同装于玩家客户端，服务端无需安装本 mod。
+- **只做流式直连**：B 站的视频/音频是两条独立 DASH 直链，边下边播，**不下载、不落盘、不留缓存文件**（只写日志、以及在游戏目录解压出 FFmpeg 原生库）。
+- **自研播放引擎**（3.0.0 起）：VLC 只剩"播放器外壳"，画面由 FFmpeg 解码（D3D11VA 硬解），音频由自研声卡输出，时钟 / 缓冲 / 换链 / 清晰度自适应全部自己做。
+- **登录安全**：内置扫码登录（`/mediafix login`），Cookie 存于用户主目录并收紧权限。
 
 ---
 
@@ -24,57 +23,125 @@ MediaFix 是一个**纯客户端**修复/增强 mod，通过 **Mixin 注入**修
 | --- | --- |
 | Minecraft | 1.21.1 |
 | NeoForge | 21.1.231 |
-| Loader | loader_version_range=[1,) |
+| Java | 21 |
+| 服务端 | 无需安装本 mod（纯客户端生效） |
 
 ## 依赖（版本固定，勿改动）
 
-依赖通过 `compileOnly fileTree('libs')` 引入编译，运行时所需前置：
+| 前置 mod | 固定版本 | 说明 |
+| --- | --- | --- |
+| WaterFrames | **v2.1.23**（NeoForge, MC 1.21.1） | 水帧显示方块 |
+| WaterMedia（WaterFrames 前置） | **2.1.36** | 播放器外壳、帧上传接口 |
+| Bilibili-Media-Mod | **2.3** | 3.0.0 起本 mod 自带解析能力，不再依赖它解析；但服务器装有时，客户端需声明该 mod id（见下） |
+| WorldComment（可选） | 任意 | 仅 `/mediafix hide` 需要 |
 
-| 前置 mod / 依赖库 | 固定版本 |
-| --- | --- |
-| WaterFrames | **v2.1.23**（NeoForge, MC 1.21.1） |
-| Bilibili-Media-Mod | **2.3**（NeoForge） |
-| WaterMedia（WaterFrames 前置） | **2.1.36** |
-| WorldComment（可选，用于`/mediafix hide`） | 0.3.2 + 1.21.1 |
-
-> 以上运行时依赖版本为硬性要求。更换版本需同步更新 `libs/` 目录下的依赖 jar 并重新编译，否则可能出现 Mixin 注入失败（`Scanned 0 target(s)`）× 或运行崩溃。
+> **FFmpeg 原生库已打进 mod jar**（约 30.5 MB），首次启动自动解压到 `<游戏目录>/mediafix-ffmpeg/`，**不需要额外安装 FFmpeg**，也不需要单独下载原生库。
+>
+> **关于 bilibili_media**：客户端可把真正的 `bilibili_media-2.3.jar` 改名 `.disabled`（解析由本 mod 接管）；本 mod 内置了一个 JiJ 占位包，仍会向服务端声明 `bilibili_media 2.3`，因此服务器端的版本校验照常通过。
 
 ---
 
-## 功能
+## 3.0.0：自研流式引擎
 
-- **B 站视频服务器观影**：服务器中的 WaterFrames 方块放置 B 站链接后，玩家客户端拉取解析并播放。
-- **先下载后播放（稳）**：`DashResolver` 将 DASH 视频/音频流下载到缓存后经本地 HTTP 服务播放；失败时自动降级（视频挂了保音频、杜比降级普通音轨），全程玩家提示。
-- **本地 HTTP 服务优化**：开启 Range 支持、扩容线程池、随机端口避免多人冲突。
-- **贴图串流修复**：修复空 `VideoPlayer` 上传帧不恢复 GL 状态导致的皮肤/方块贴图串流污染。
-- **进度纠偏**：修复 `Display.tick` 陈旧同步误 `seekTo(0)` 导致的视频随机跳回开头。
-- **信箱化解黑边**：非 16:9 屏幕上按比例居中放大，黑边占位，不做拉伸变形（越界有防御兜底，不卡黑屏）。
-- **全景声（WASAPI）**：强制 VLC `aout=mmdevice`(WASAPI) 输出多声道，并根据与方块距离**自动**在 WASAPI 独占 / 共享模式间切换，不打扰 MC 音效（800ms 防抖）。
+VLC 那条链路（先下载缓存再播放）已**整条移除**。现在的工作方式：
+
+### 视频
+- **DASH 直连**：wbi 签名请求 `playurl`（`fnval=4048`），从 `dash.video` 里按可用的最高档挑选，支持 4K / HDR / 8K 档位。
+- **硬件解码**：H.264 / HEVC 走 D3D11VA，帧经 GPU→CPU 搬运后多线程分带转 RGBA 再上传纹理。
+- **避开 AV1**：多数显卡无 AV1 硬解，软解 4K 只有 3~4fps。默认避开，可在 `mediafix-stream.json` 里改 `avoidAv1`。
+- **清晰度自适应（ABR）**：默认 `auto` —— 按实测下载吞吐在可用档位间平滑升降（下档更敏感、上档需要持续健康），也可手动锁定某一档。
+- **无缝换链**：B 站直链约 2 小时过期；到期前自动重新解析并**热切换**新链，声音不断、播放位置不变。也可用 `/mediafix refresh` 手动触发。
+- **就地快进**：进度同步要求向前跳时，直接在已预读的码流里丢弃数据，不重开连接、不清空缓冲。
+- **信箱化**：非 16:9 的屏幕上按比例居中放大，黑边占位，不拉伸变形。
+
+### 音频
+- **自研声卡输出**（Java Sound），不再依赖 VLC 的音频输出。
+- **音轨偏好**：默认优先 **杜比全景声（E-AC-3, 6ch）**，其次 **Hi-Res 无损（FLAC）**，最后普通音轨里码率最高的一条；缺失任何一档都自动回退，不会没声音。
+- **多声道**：设备支持多少声道就输出多少（源 5.1 遇 2ch 设备时按标准下混矩阵折成立体声，不是简单丢声道）。
+- **音画同步**：以音频可听位置为主时钟（死区 + 残差平滑 + ≤3%/秒 速率微调 + 离群剔除），画面跟随时钟。
+
+### 稳定性
+- **进度纠偏守卫**：拦截 WaterFrames 陈旧同步导致的 `seekTo(0)`（视频随机跳回开头）。
+- **原地 seek 过滤**：目标与当前位置几乎相同的 seek 直接忽略（对网络流来说它意味着重开连接 + 清空缓冲）。
+- **播放器重建时引擎转交**：WaterFrames 重建播放器对象时不重新缓冲、位置不丢。
+- **详细诊断**：`/mediafix status` 与游戏目录下的日志可查状态机、时钟残差、帧率、丢帧、缓冲水位。
+
+---
 
 ## 指令
 
 | 指令 | 作用 |
 | --- | --- |
-| `/mediafix help` | 查看全部子指令帮助 |
-| `/mediafix hide [on\|off]` | 切换 WorldComment 评论全隐藏（默认切换） |
-| `/mediafix seekguard` | 查看当前进度纠偏阈值 |
-| `/mediafix seekguard <秒>` | 设置进度纠偏阈值（1~60 秒，忽略陈旧 seek 用） |
-| `/mediafix-stream [on\|off]` | 切换 DASH 高清缓存播放 |
-| `/mediafix-stream quality` | 设置清晰度 / qn |
-| `/mediafix-stream cache` | 查看 / 清空视频缓存 |
-
-配置文件（生成于游戏根目录）：`mediafix-stream.json`、`mediafix-seekguard.json`、`mediafix-comment.json` 等。
+| `/mediafix help` | 显示全部子指令帮助 |
+| `/mediafix refresh` | **手动刷新当前视频**：重新解析直链 + 无缝换链（位置不变） |
+| `/mediafix refresh full` | 强制重建引擎（换链救不回来时用） |
+| `/mediafix streams` | 列出本视频实际可选的每条流（编码 / 真实分辨率 / 码率，可辨别"真假 4K"） |
+| `/mediafix-stream quality <档位>` | 锁定清晰度：`auto`(默认，按网速自适应) / `360p`~`4k` / `max` |
+| `/mediafix-stream streaming on\|off` | 开关 DASH 流式直连（关闭则回退前置原生播放） |
+| `/mediafix-stream streaming <毫秒>` | 音画偏移微调（正 = 画面提前） |
+| `/mediafix audio` | 音频链现状：选中音轨、源/输出格式、设备最大声道数 |
+| `/mediafix audio dolby\|hires\|best` | 切换音频偏好（杜比优先 / 无损优先 / 只取普通最高码率） |
+| `/mediafix login` | B 站扫码登录（4K / 杜比 / 高清直链必需） |
+| `/mediafix login status` | 查看登录态 |
+| `/mediafix login logout` | 清除登录态 |
+| `/mediafix status` | 引擎 / 原生库 / 流式开关 + 本次播放的 seek 统计 |
+| `/mediafix seekguard [秒]` | 查看 / 调整进度纠偏阈值（默认 5 秒） |
+| `/mediafix-stream` | 流式播放参数现状 |
+| `/mediafix hide [on\|off]` | 切换 WorldComment 评论隐藏（无参 = 切换） |
 
 ---
 
-## 构建
+## 配置文件（生成于游戏目录）
+
+| 文件 | 说明 |
+| --- | --- |
+| `mediafix-stream.json` | 流式开关、清晰度上限 / 自适应、音频偏好、就地快进跨度上限 |
+| `mediafix-ffmpeg.json` | 原生库路径、硬件解码、预缓冲、音频缓冲、解码帧缓冲、预读大小、日志详略 |
+| `mediafix-seekguard.json` | 进度纠偏阈值、原地 seek 容差 |
+| `mediafix-bili.json` | 登录 Cookie（可手填覆盖扫码结果） |
+| `mediafix-log.json` | 日志级别 |
+| `mediafix-comment.json` | WorldComment 评论隐藏开关 |
+
+## 日志
+
+| 位置 | 内容 |
+| --- | --- |
+| `<游戏目录>/mediafixlogs/mediafix-<日期_时间>.log` | 本 mod 的完整诊断日志（保留最近 10 份） |
+| `<游戏目录>/logs/latest.log` | 关键 INFO / WARN 也会进这里 |
+
+---
+
+## 构建与部署
 
 ```bash
+# 仅构建（产物在 build/libs/）
 gradlew build
 ```
 
-构建产物位于 `build/libs/`。产物 jar 放入客户端 `mods/` 目录即可。
+仓库自带部署脚本，会先构建再把 jar 复制进客户端实例（**只动 mediafix- 开头的文件，不碰任何其它 mod 与玩家配置**）：
+
+```powershell
+.\deploy.ps1                                   # 默认实例路径见脚本第 17 行
+.\deploy.ps1 -Instance "D:\some\instance"     # 指定其它实例
+.\deploy.ps1 -SkipBuild                        # 跳过构建，只复制现有产物
+```
+
+> 改动 mod 后**必须重启游戏**才会生效。
+
+---
+
+## 已知限制
+
+- **需要登录 / 大会员**：4K、杜比全景声、Hi-Res 无损都要求 B 站大会员账号；未登录或权限不足时自动降级到可用档位。
+- **杜比全景声只到 5.1 底混**：FFmpeg 能解 E-AC-3 的 5.1 bed，但**不解 Atmos 对象层**（没有开源渲染器）；另外是否多声道输出取决于系统是否把输出设备配置成 5.1/7.1 —— 若系统只暴露 2 声道，会按标准矩阵下混成立体声。
+- **AV1 默认避开**：无 AV1 硬解的显卡上软解 4K AV1 只有个位数帧率；需要时可关闭 `avoidAv1`。
+- **DRM / 仅试看内容**：自动回退前置原生播放。
+- **纯客户端**：服务端加载本 mod 时静默跳过。
+
+## 合规
+
+本 mod **只做流式直连播放**：不下载视频到本地、不留缓存文件、不提供任何离线保存能力。需要下载的场景请使用 B 站官方客户端。
 
 ## 许可
 
-本项目采用 **MIT License**。注意：`TEMPLATE_LICENSE.txt` 为 NeoForge MDK 模板自带许可，仅适用于模板文件本身。
+本项目采用 **MIT License**。`TEMPLATE_LICENSE.txt` 为 NeoForge MDK 模板自带许可，仅适用于模板文件本身。

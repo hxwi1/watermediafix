@@ -31,9 +31,6 @@ public abstract class BilibiliPatchMixin {
             require = 1)
     private void mediafix$streamingPatch(URI uri, AbstractPatch.Quality prefQuality,
                                          CallbackInfoReturnable<AbstractPatch.Result> cir) {
-        if (!StreamConfig.stream) {
-            return; // 关：走原逻辑整文件下载
-        }
         try {
             URI longUri = uri;
             if (uri.toString().contains("b23.tv")) {
@@ -43,10 +40,10 @@ public abstract class BilibiliPatchMixin {
 
             // DASH 高清链路（能拿多高清拿多高清，受 /mediafix-stream quality 上限约束）
             if (StreamConfig.highres) {
-                AbstractPatch.Result dash = DashResolver.resolve(self, longUri);
+                AbstractPatch.Result dash = DashResolver.resolve(longUri);
                 if (dash != null) {
                     cir.setReturnValue(dash);
-                    MediaFix.LOGGER.info("[mediafix] 已切换为 DASH 高清缓存(先下载后播)");
+                    MediaFix.LOGGER.info("[mediafix] 已切换为 DASH 流式直连(边下边播)");
                     return;
                 }
             }

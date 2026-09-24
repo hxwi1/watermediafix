@@ -3,7 +3,6 @@ package dev.mediafix.command;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import dev.mediafix.MediaFix;
 import dev.mediafix.config.StreamConfig;
-import dev.polaris_light.bilibili_media.util.BilibiliMediaUtil;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
@@ -14,13 +13,12 @@ import java.lang.reflect.Field;
 import java.util.Map;
 
 /**
- * 指令：/mediafix-stream —— 高清缓存播放管理。
+ * 指令：/mediafix-stream —— 流式播放管理（只做边下边播，不落盘）。
  * <ul>
  *   <li>/mediafix-stream [on|off] —— 开关 DASH 高清缓存播放；</li>
  *   <li>/mediafix-stream quality [档位] —— 查看/设置清晰度上限
  *       (360p/480p/720p/720p60/1080p/1080p60/4k/auto)；</li>
  *   <li>/mediafix-stream cache —— 查看缓存占用；</li>
- *   <li>/mediafix-stream cache clear —— 清空本地视频缓存（含前置 mod 下载的）。</li>
  * </ul>
  */
 public final class StreamCommand {
@@ -31,8 +29,6 @@ public final class StreamCommand {
     public static void register(RegisterClientCommandsEvent event) {
         LiteralArgumentBuilder<CommandSourceStack> cmd = Commands.literal("mediafix-stream")
                 .executes(ctx -> status(ctx.getSource()))
-                .then(Commands.literal("on").executes(ctx -> setStream(ctx.getSource(), true)))
-                .then(Commands.literal("off").executes(ctx -> setStream(ctx.getSource(), false)))
                 .then(Commands.literal("quality")
                         .executes(ctx -> showQuality(ctx.getSource()))
                         .then(Commands.literal("360p").executes(ctx -> setQuality(ctx.getSource(), 16)))
@@ -42,33 +38,63 @@ public final class StreamCommand {
                         .then(Commands.literal("1080p").executes(ctx -> setQuality(ctx.getSource(), 80)))
                         .then(Commands.literal("1080p60").executes(ctx -> setQuality(ctx.getSource(), 116)))
                         .then(Commands.literal("4k").executes(ctx -> setQuality(ctx.getSource(), 120)))
-                        .then(Commands.literal("auto").executes(ctx -> setQuality(ctx.getSource(), 0))))
-                .then(Commands.literal("cache")
-                        .executes(ctx -> cacheInfo(ctx.getSource()))
-                        .then(Commands.literal("clear").executes(ctx -> cacheClear(ctx.getSource()))));
+                        .then(Commands.literal("auto").executes(ctx -> setQuality(ctx.getSource(), -1)))
+                        .then(Commands.literal("max").executes(ctx -> setQuality(ctx.getSource(), 0))))
+                .then(Commands.literal("streaming")
+                        .executes(ctx -> status(ctx.getSource()))
+                        .then(Commands.literal("on").executes(ctx -> setStreaming(ctx.getSource(), true)))
+                        .then(Commands.literal("off").executes(ctx -> setStreaming(ctx.getSource(), false)))
+                        .then(Commands.argument("offsetMs", com.mojang.brigadier.arguments.IntegerArgumentType.integer(-5000, 5000))
+                                .executes(ctx -> setOffset(ctx.getSource(),
+                                        com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(ctx, "offsetMs")))));
         event.getDispatcher().register(cmd);
     }
 
     private static int status(CommandSourceStack source) {
+        String q = qualityName(StreamConfig.maxQn);
+        if (StreamConfig.autoQuality()) {
+            dev.mediafix.abr.AbrLadder.Candidate cur = dev.mediafix.abr.AbrLadder.current();
+            long est = dev.mediafix.abr.AbrController.estimateBps();
+            q = q + (cur == null ? "（等待解析）"
+                    : "（当前 " + cur.label() + " " + (cur.bandwidthBps() / 1000) + "kbps"
+                      + (est > 0 ? "，实测带宽 " + (est / 1000) + "kbps" : "，暂无测速") + "）");
+        }
+        final String quality = q;
         source.sendSuccess(() -> Component.literal(
-                "[mediafix] 高清缓存播放: " + (StreamConfig.stream ? "开" : "关")
-                        + " | 清晰度上限: " + qualityName(StreamConfig.maxQn)
-                        + " | /mediafix-stream quality|cache 调节"), false);
+                "[mediafix] 流式播放: " + (StreamConfig.dashStreaming ? "开" : "关")
+                        + " | 清晰度: " + quality
+                        + (StreamConfig.streamOffsetMs != 0 ? " (偏移 " + StreamConfig.streamOffsetMs + "ms)" : "")
+                        + " | /mediafix-stream quality|streaming 调节"), false);
         return 1;
     }
 
-    private static int setStream(CommandSourceStack source, boolean value) {
-        StreamConfig.stream = value;
+    /** /mediafix-stream streaming —— 开关 DASH 流式直连（不下载）。 */
+    private static int setStreaming(CommandSourceStack source, boolean value) {
+        StreamConfig.dashStreaming = value;
+        StreamConfig.save();
+        boolean usable = value && dev.mediafix.ffmpeg.FfmpegRuntime.available();
+        source.sendSuccess(() -> Component.literal(
+                "[mediafix] DASH 流式直连: " + (value ? "开" : "关")
+                        + (value && !usable
+                        ? " （注意：FFmpeg 原生库不可用，当前会交回前置模组）"
+                        : " （对之后打开的视频生效）")), false);
+        return 1;
+    }
+
+    /** /mediafix-stream streaming <毫秒> —— 音画偏移微调：正数=画面提前。 */
+    private static int setOffset(CommandSourceStack source, int offsetMs) {
+        StreamConfig.streamOffsetMs = offsetMs;
         StreamConfig.save();
         source.sendSuccess(() -> Component.literal(
-                "[mediafix] 高清缓存播放 : " + (value ? "开 (DASH先下载后播)" : "关 (前置原生下载)")), false);
+                "[mediafix] 流式音画偏移: " + offsetMs + "ms (" + (offsetMs == 0 ? "不调整"
+                        : offsetMs > 0 ? "画面提前" : "画面滞后") + ")"), false);
         return 1;
     }
 
     private static int showQuality(CommandSourceStack source) {
         source.sendSuccess(() -> Component.literal(
-                "[mediafix] 当前清晰度上限: " + qualityName(StreamConfig.maxQn)
-                        + "，可选: 360p 480p 720p 720p60 1080p 1080p60 4k auto"), false);
+                "[mediafix] 当前清晰度: " + qualityName(StreamConfig.maxQn)
+                        + "，可选: auto(自动) 360p 480p 720p 720p60 1080p 1080p60 4k max"), false);
         return 1;
     }
 
@@ -83,63 +109,8 @@ public final class StreamCommand {
         return 1;
     }
 
-    private static int cacheInfo(CommandSourceStack source) {
-        File dir = BilibiliMediaUtil.getDownloadPath().toFile();
-        File[] files = dir.listFiles();
-        long size = 0;
-        int count = 0;
-        if (files != null) {
-            for (File f : files) {
-                if (f.isFile()) {
-                    size += f.length();
-                    count++;
-                }
-            }
-        }
-        final long sizeMb = size / 1048576;
-        final int n = count;
-        source.sendSuccess(() -> Component.literal(
-                "[mediafix] 视频缓存: " + n + " 个文件, 共 " + sizeMb + "MB"
-                        + " | 目录: " + dir.getName()
-                        + " | /mediafix-stream cache clear 清空"), false);
-        return 1;
-    }
-
-    private static int cacheClear(CommandSourceStack source) {
-        File dir = BilibiliMediaUtil.getDownloadPath().toFile();
-        long freed = 0;
-        int failed = 0;
-        // 先让前置清掉它登记的条目（会一并删除对应文件并更新 video.json）
-        try {
-            BilibiliMediaUtil.clearCache(0);
-        } catch (Throwable t) {
-            MediaFix.LOGGER.warn("[mediafix] 前置缓存清理异常，继续手动删除", t);
-        }
-        File[] files = dir.listFiles();
-        if (files != null) {
-            for (File f : files) {
-                if (f.isFile()) {
-                    long len = f.length();
-                    if (f.delete()) {
-                        freed += len;
-                    } else {
-                        failed++;
-                    }
-                }
-            }
-        }
-        // 缓存全清了，解析缓存也一并清掉，避免指向已删除文件
-        clearWatermediaCaches();
-        final long freedMb = freed / 1048576;
-        final int fail = failed;
-        source.sendSuccess(() -> Component.literal(
-                "[mediafix] 缓存已清空, 释放 " + freedMb + "MB"
-                        + (fail > 0 ? " (" + fail + " 个文件被占用未删，关闭播放后重试)" : "")), false);
-        return 1;
-    }
-
     /** 清空 watermedia 的 NetworkAPI/图片解析缓存（反射，尽力而为），使设置立即生效。 */
-    private static void clearWatermediaCaches() {
+    public static void clearWatermediaCaches() {
         clearStaticMap("org.watermedia.api.network.NetworkAPI", "CACHE");
         clearStaticMap("org.watermedia.api.image.ImageCache", "CACHE");
     }
@@ -159,7 +130,8 @@ public final class StreamCommand {
 
     private static String qualityName(int qn) {
         return switch (qn) {
-            case 0 -> "auto(不限)";
+            case -1 -> "自动(按网速自适应)";
+            case 0 -> "最高(不限)";
             case 16 -> "360P";
             case 32 -> "480P";
             case 64 -> "720P";

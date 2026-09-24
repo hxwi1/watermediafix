@@ -30,9 +30,6 @@ public abstract class BilibiliBangumiPatchMixin {
             require = 1)
     private void mediafix$dashBangumi(URI uri, AbstractPatch.Quality prefQuality,
                                       CallbackInfoReturnable<AbstractPatch.Result> cir) {
-        if (!StreamConfig.stream) {
-            return; // 关：走原逻辑
-        }
         try {
             URI longUri = uri;
             if (uri.toString().contains("b23.tv")) {
@@ -40,10 +37,10 @@ public abstract class BilibiliBangumiPatchMixin {
             }
             // 只处理 ep 番剧链接；resolve 内部对 ep 走 pgc 链路（不需要 BilibiliPatch 实例）
             if (StreamConfig.highres && DashResolver.parseEpId(longUri.toString()) != null) {
-                AbstractPatch.Result dash = DashResolver.resolve(null, longUri);
+                AbstractPatch.Result dash = DashResolver.resolve(longUri);
                 if (dash != null) {
                     cir.setReturnValue(dash);
-                    MediaFix.LOGGER.info("[mediafix] 番剧已切换为 DASH 高清缓存(先下载后播)");
+                    MediaFix.LOGGER.info("[mediafix] 番剧已切换为 DASH 流式直连(边下边播)");
                     return;
                 }
             }

@@ -26,7 +26,7 @@ public abstract class DisplayDiagMixin {
 
     @Inject(method = "switchVideoMode", at = @At("HEAD"))
     private void mediafix$logSwitch(CallbackInfo ci) {
-        MediaFix.LOGGER.info("[mediafix][diag] switchVideoMode 被调用: isVideo={} status={}",
+        MediaFix.LOGGER.diag("[mediafix][diag] switchVideoMode 被调用: isVideo={} status={}",
                 imageCache.isVideo(), imageCache.getStatus());
     }
 
@@ -37,7 +37,7 @@ public abstract class DisplayDiagMixin {
             return;
         }
         mediafix$lastTickLog = now;
-        MediaFix.LOGGER.info("[mediafix][diag] Display.tick: mode={} notVideo={} isVideo={} status={}",
+        MediaFix.LOGGER.diag("[mediafix][diag] Display.tick: mode={} notVideo={} isVideo={} status={}",
                 displayMode, notVideo, imageCache.isVideo(), imageCache.getStatus());
     }
 }

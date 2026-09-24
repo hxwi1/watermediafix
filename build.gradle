@@ -27,6 +27,8 @@ sourceSets.main.resources {
 }
 
 repositories {
+    // FFmpeg(JavaCPP) 绑定来自 Maven Central
+    mavenCentral()
     // 阿里云镜像，加速下载
     maven { url = "https://maven.aliyun.com/repository/public" }
     maven { url = "https://maven.aliyun.com/repository/central" }
@@ -120,7 +122,20 @@ neoForge {
 // "optional", meaning it will not be pulled by dependents of this mod.
 configurations {
     runtimeClasspath.extendsFrom localRuntime
+
+    // FFmpeg(JavaCPP) 的 Java 绑定：shaded 进本 mod 的 jar（体积约十几 MB）
+    ffmpegApi
+    // 其它需要 shaded 进主 jar 的小库（如 ZXing：登录二维码）
+    shadedLibs
+    // FFmpeg 原生库（DLL/so）：压缩包打进 jar 的资源目录，运行时解压
+    ffmpegNatives
 }
+// 只要有 classifier 的原生产物，不要它传递依赖进来的 base jar（那些 Java class 已经 shade 进主 jar）
+configurations.ffmpegNatives.transitive = false
+
+// 版本与 watermedia v3 所用的一致，便于对照；这只是选用同一个上游库，不涉及任何代码复用
+ext.ffmpegBindingVersion = '8.0.1-1.5.13'
+ext.javacppVersion = '1.5.13'
 
 dependencies {
     // 目标 mod（waterframes / bilibili_media / watermedia）仅供编译期使用。
@@ -130,6 +145,86 @@ dependencies {
 
     // 备选：若不想手动放置 jar，可取消注释用 curse 拉取（须与运行时版本一致）
     // compileOnly "curse.maven:watermedia-869524:6875641"
+
+    // bilibili_media 空壳：打进本 jar 的 META-INF/jarjar/，让客户端的模组列表里出现
+    // bilibili_media 2.3，从而通过装了真 bilibili_media 2.3 的服务端的 MATCH_VERSION 校验。
+    // 详见 bilibili-media-stub/ （无代码，lowcodefml 元数据）。
+    // 空壳与真 bilibili_media 互斥（同 modId）。构建时加 -PnoStub 即可产出"不带空壳"的版本，
+    // 用于客户端需要真实 bilibili_media（会做 B 站链接解析）的场景。
+    if (!project.hasProperty('noStub')) {
+        jarJar(project(':bilibili-media-stub'))
+    }
+
+    // FFmpeg（JavaCPP 绑定）：编译期 + 打进本 jar
+    compileOnly "org.bytedeco:javacpp:${javacppVersion}"
+    compileOnly "org.bytedeco:ffmpeg:${ffmpegBindingVersion}"
+    ffmpegApi "org.bytedeco:javacpp:${javacppVersion}"
+    ffmpegApi "org.bytedeco:ffmpeg:${ffmpegBindingVersion}"
+
+    // 原生库：仅在本地打包/验证时参与（windows-x86_64；其它平台按需加 classifier）
+    ffmpegNatives "org.bytedeco:javacpp:${javacppVersion}:windows-x86_64"
+    ffmpegNatives "org.bytedeco:ffmpeg:${ffmpegBindingVersion}:windows-x86_64"
+
+    // 登录二维码：ZXing core（Apache-2.0），只需 core，PNG 由 JDK 的 ImageIO 写
+    compileOnly "com.google.zxing:core:3.5.3"
+    shadedLibs "com.google.zxing:core:3.5.3"
+}
+
+// 生成原生库压缩包：既用于塞进主 jar，也可单独分发
+// （放到 mods/ 或 config/mediafix/natives/ 下同样能被自动发现）
+def ffmpegNativesZip = tasks.register('ffmpegNativesZip', Zip) {
+    group = 'mediafix'
+    description = '打包 FFmpeg 原生库（当前为 windows-x86_64）'
+    archiveFileName = 'mediafix-ffmpeg-natives-windows-x86_64.zip'
+    destinationDirectory = layout.buildDirectory.dir('libs')
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(provider { configurations.ffmpegNatives.collect { it.isDirectory() ? it : zipTree(it) } }) {
+        // 只要原生库目录下的东西
+        include '**/windows-x86_64/**'
+        include '**/linux-x86_64/**'
+        exclude 'META-INF/**'
+        exclude 'module-info.class'
+    }
+}
+
+/*
+ * 把 FFmpeg 的 Java 绑定 + 原生库压缩包一起打进本 mod 的 jar。
+ *
+ * 运行时由 dev.mediafix.ffmpeg.FfmpegRuntime 把 jar 内的 mediafix-natives/ffmpeg-natives.zip
+ * 解压到 <gamedir>/mediafix-ffmpeg/v2-bundled-<大小>-<CRC>/，再交给 JavaCPP 加载。
+ * 这样分发只需要【一个 jar】；旧版那种"jar + 单独 natives zip"的方式仍然兼容，
+ * 也可以用 -PnoNativesInJar 退回（产出一个不含原生库的小 jar）。
+ */
+tasks.named('jar', Jar).configure {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from(provider { configurations.ffmpegApi.collect { it.isDirectory() ? it : zipTree(it) } }) {
+        exclude 'META-INF/**'
+        exclude 'module-info.class'
+        exclude '**/*.dll', '**/*.so', '**/*.dylib'   // 原生库不进主 jar 的类目录
+    }
+    from(provider { configurations.shadedLibs.collect { it.isDirectory() ? it : zipTree(it) } }) {
+        exclude 'META-INF/**'
+        exclude 'module-info.class'
+    }
+}
+
+/*
+ * 原生库压缩包同时放进【资源目录】。
+ *
+ * 这一步是给开发环境用的：IDEA 里跑 client（ModDevGradle 的 dev 环境）时，
+ * classpath 上挂的是 build/resources/main（以及 classes），**不读 jar** ——
+ * 只把原生库加进 jar 任务的话，dev 环境会找不到 FFmpeg。
+ * 放进资源目录后：jar 任务会自动带上它（无需再单独 from），dev 环境也能直接读到。
+ * 加 -PnoNativesInJar 时两者都不包含，退回"小 jar + 单独 zip"的方式。
+ */
+if (!project.hasProperty('noNativesInJar')) {
+    tasks.named('processResources', ProcessResources).configure {
+        dependsOn ffmpegNativesZip
+        from(ffmpegNativesZip.flatMap { it.archiveFile }) {
+            into 'mediafix-natives'
+            rename { 'ffmpeg-natives.zip' }
+        }
+    }
 }
 
 // This block of code expands all declared replace properties in the specified resource targets.

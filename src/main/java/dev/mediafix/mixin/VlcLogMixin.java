@@ -25,7 +25,7 @@ import java.util.List;
 public abstract class VlcLogMixin {
 
     /** VLC 日志文件位置（临时目录，无空格路径，便于 VLC 写入）。 */
-    public static final String VLC_LOG_PATH =
+    private static final String VLC_LOG_PATH =
             Path.of(System.getProperty("java.io.tmpdir"), "mediafix-vlc.log").toString();
 
     @ModifyVariable(

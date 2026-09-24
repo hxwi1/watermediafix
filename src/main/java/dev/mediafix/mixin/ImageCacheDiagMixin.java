@@ -21,13 +21,13 @@ public abstract class ImageCacheDiagMixin {
 
     @Inject(method = "lambda$load$1", at = @At("HEAD"))
     private void mediafix$logErrCallback(Exception e, Boolean isVideo, CallbackInfo ci) {
-        MediaFix.LOGGER.info("[mediafix][diag] ImageCache 错误回调: ex={} isVideo={} status={} video={}",
+        MediaFix.LOGGER.diag("[mediafix][diag] ImageCache 错误回调: ex={} isVideo={} status={} video={}",
                 e == null ? "null" : e.getClass().getSimpleName(), isVideo, status, video);
     }
 
     @Inject(method = "lambda$load$0", at = @At("HEAD"))
     private void mediafix$logOkCallback(org.watermedia.api.image.ImageRenderer renderer, Boolean cached, CallbackInfo ci) {
-        MediaFix.LOGGER.info("[mediafix][diag] ImageCache 成功回调: renderer={} cached={} status={} video={}",
+        MediaFix.LOGGER.diag("[mediafix][diag] ImageCache 成功回调: renderer={} cached={} status={} video={}",
                 renderer == null ? "null" : renderer.getClass().getSimpleName(), cached, status, video);
     }
 }

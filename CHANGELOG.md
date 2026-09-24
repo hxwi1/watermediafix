@@ -1,6 +1,55 @@
 # MediaFix 更新日志
 
-> MediaFix：`WaterFrames + Bilibili-Media-Mod` 纯客户端修复附属，所有功能通过 Mixin 注入，**不改动任何前置 mod 源码**。
+> MediaFix：`WaterFrames + WaterMedia` 的**纯客户端**修复/增强附属。3.0.0 起播放链路整体换成**自研 FFmpeg DASH 流式引擎**，所有功能仍通过 Mixin 注入，**不改动任何前置 mod 源码**。
+
+---
+
+## v3.0.0 (2026-09-24) —— 自研 FFmpeg DASH 流式引擎
+
+> 这一版把播放链路整个换掉：**VLC 只做外壳，解码 / 时钟 / 音频输出 / 换链全部自研**；同时把"先下载缓存再播放"整条移除，只保留合规的流式直连。
+
+### 🎬 引擎（新增 `dev.mediafix.engine` / `dev.mediafix.ffmpeg`）
+- `MediaEngine`：状态机（LOADING / PLAYING / PAUSED / BUFFERING / ENDED / ERROR）、自研时钟、看门狗、水位线、ABR 调度、直链续期、无缝换源
+- `FfmpegVideoSource`：FFmpeg 解 DASH 视频，D3D11VA 硬解；GPU→CPU 搬运后多线程**分带 sws** 转 RGBA；帧环背压；就地快进
+- `FfmpegAudioSource` + `AudioSink`：自研音频链与声卡输出（Java Sound），多声道协商、软件增益、欠载 / 截断 / 爆音计数
+- `MediaClock`：以**音频可听位置**为主时钟（死区 40ms + 残差 EMA + 速率微调 ≤3%/s + 单次离群剔除 / 连续离群硬对齐）
+- `PacketBuffer`：压缩流预读队列（视频 48MB / 音频 8MB），解复用与解码分离、互不阻塞
+- `MediaEngines`：引擎注册表（WeakHashMap + ReferenceQueue 回收）；播放器对象被重建时**引擎转交**、孤儿宽限
+
+### 🔊 音频
+- 杜比全景声（E-AC-3 6ch）/ Hi-Res 无损（FLAC）/ 普通 AAC 按偏好自动选择，缺失自动回退，不会没声音
+- 多声道按设备能力输出；源 5.1 遇 2ch 设备时按**标准下混矩阵**折立体声（不是丢声道）
+- 新增 `/mediafix audio [dolby|hires|best]`
+
+### 📶 清晰度
+- ABR 自适应（默认 `auto`）：按实测下载吞吐在可用档位间升降（保守取 min(快/慢) 估计、下档 0.90 / 上档 0.70、带驻留时间约束）
+- 档位去重 + 编码偏好（H.264 > HEVC > AV1），默认**避开 AV1**（无硬解时软解 4K 只有个位数帧率）
+- 新增 `/mediafix streams`：列出每条流的编码 / 真实分辨率 / 码率，可辨别"标称 4K 实为 1080p"
+
+### 🔁 稳定性（本版集中修掉的几类问题）
+- **时钟不再被永久冻住**：修复"seek / 视频饥饿 pause 时钟后，状态被翻成 PLAYING 却没人 start 时钟"。该状态下 `update()` 只把冻结时间设成音频可听位置，时钟退化成**每批音频跳一次（~200ms）**，视频帧成批过期 —— 表现为起播后长时间只有 3~4fps、每秒丢 21 帧，且只有人工暂停/恢复才能救回
+- **直链续期**：到期前自动重新解析并热切换（声音不断、位置不变）；新增 `/mediafix refresh [full]`
+- **就地快进**：进度同步要求小幅前跳时在已预读数据里丢弃，不重开连接、不清空缓冲（消除"卡一下 → 倍速追赶 → 再卡"）
+- **帧归还与数据源解耦**：帧自带产出它的那条源，换链 / 关闭后归还不再落空（此前实测取走 550 帧只归还 90 次）
+- **纹理强制重分配**：播放器实例或纹理 id 变化时重建纹理存储，修掉"多次换视频 / 刷新后只有声音没画面"
+- **停止 / 暂停优先**：看门狗兜底不再覆盖用户的暂停意图（此前按停止后 4 秒会被拽回播放）
+- **原地 seek 过滤 + 陈旧同步拦截**：避免无谓的"重开连接 + 清空音频缓冲"
+- **同源判定按流路径**：直链签名每次解析都变，也能认出"同一个视频"，播放器重建时不再重新缓冲
+
+### 🗑️ 移除
+- 整条"先下载到本地缓存再播放"路径（`MediaStreamProxy`、`MediaCache`、`SimpleFileServerMixin`、下载进度 UI）—— 下载到本地属于灰色地带，现在只做流式直连
+- `/mediafix ffmpeg on|off|offset`（引擎常开）、`/mediafix-stream cache` 相关指令
+
+### ⚙️ 配置与工具
+- 新增 `mediafix-ffmpeg.json`（原生库路径 / 硬解 / 预缓冲 / 缓冲区）、`mediafix-bili.json`、`mediafix-log.json`
+- `mediafix-stream.json` 增加 `audioPreference`、`avoidAv1`、`catchUpMaxMs`
+- 新增 `deploy.ps1`：一键构建 + 部署到客户端实例（**只动 `mediafix-*` 文件**）
+
+### ✅ 已离线验证
+- 打包的 FFmpeg 原生库可加载（`av_version_info = 8.0.1`）
+- 扫码登录全链路（生成二维码 → PNG → 解码比对 → 轮询 `qrcode_key`）
+- 杜比音轨可解（`eac3 6ch 48000Hz`，80/80 帧解码成功）
+- 音频 seek 落点误差 −22 ~ 0 ms；视频 seek 落点与首帧时间戳符合预期（第 0 帧 = 0.0ms）
 
 ---
 
